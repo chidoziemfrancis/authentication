@@ -1,0 +1,55 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+import type { IncomingHttpHeaders } from 'node:http';
+import { Injectable, type ExecutionContext } from '@nestjs/common';
+import type { AuthenticationResult } from '../interfaces/authentication-result.interface.js';
+
+export interface Scope {
+  result: AuthenticationResult<any, any> | null;
+  /** The call being handled; absent inside `AuthenticationContext.run()`. */
+  context?: ExecutionContext;
+}
+
+/** The request and response of an HTTP call, as the platform (Express, Fastify) provides them. */
+export interface HttpExchange {
+  request: { headers: IncomingHttpHeaders; method?: string; ip?: string };
+  response?: unknown;
+}
+
+/**
+ * @internal The per-call scope behind `AuthenticationContext` and
+ * `SignInService`: its own `AsyncLocalStorage`, opened around each handler
+ * by `AuthenticationScopeInterceptor`.
+ */
+@Injectable()
+export class AuthenticationScope {
+  private readonly storage = new AsyncLocalStorage<Scope>();
+
+  get current(): Scope | undefined {
+    return this.storage.getStore();
+  }
+
+  run<R>(scope: Scope, fn: () => R): R {
+    return this.storage.run(scope, fn);
+  }
+
+  /**
+   * The HTTP request and response of the current call: an HTTP handler, or
+   * a GraphQL resolver whose context carries `req` (and `res`).
+   */
+  exchange(): HttpExchange | undefined {
+    const context = this.current?.context;
+
+    switch (context?.getType<string>()) {
+      case 'http': {
+        const http = context!.switchToHttp();
+        return { request: http.getRequest(), response: http.getResponse() };
+      }
+      case 'graphql': {
+        const gql = context!.getArgByIndex(2);
+        return gql?.req ? { request: gql.req, response: gql.res } : undefined;
+      }
+      default:
+        return undefined;
+    }
+  }
+}

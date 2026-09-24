@@ -1,0 +1,150 @@
+import { Injectable, type CanActivate, type ExecutionContext } from '@nestjs/common';
+import { HttpAdapterHost, Reflector } from '@nestjs/core';
+import { hasVerifiedEmail } from '../account/email.util.js';
+import { getRawResult, setAuthState, setRawResult } from '../utils/auth-state.util.js';
+import { AuthenticationRegistry } from '../services/authentication-registry.service.js';
+import type { CredentialProvider } from '../interfaces/authentication-registry.interface.js';
+import { AUTHENTICATION_GUARD_BRAND, AUTHENTICATION_METADATA } from '../authentication.constants.js';
+import type { RouteAuthentication } from '../interfaces/authenticate-options.interface.js';
+import { AuthenticationError } from '../errors/authentication.error.js';
+import { refusal, type Refusal } from '../utils/transport-errors.util.js';
+import type { AuthenticationResult } from '../interfaces/authentication-result.interface.js';
+
+type Provider = CredentialProvider<unknown, unknown>;
+
+/** Which provider produced a result, for `@Authenticate({ providers })` on a cached result. */
+const producedBy = new WeakMap<object, Provider>();
+
+const MFA_REQUIRED: Refusal = { message: 'Second factor required', code: 'mfa_required' };
+const EMAIL_UNVERIFIED: Refusal = { status: 403, message: 'Email address not verified', code: 'email_unverified' };
+
+/**
+ * Runs the registered providers in order and records the first result on
+ * the call.
+ *
+ * | Route | No credentials | Valid | Invalid |
+ * | --- | --- | --- | --- |
+ * | default | 401 | pass | 401 |
+ * | `@Authenticate({ optional: true })` | pass, user `null` | pass | 401 |
+ * | `@Public()` | providers not called | not called | not called |
+ *
+ * A result with `mfa: 'pending'` (second factor outstanding) does not count
+ * as signed in: 401 `mfa_required` where a user is required, anonymous on
+ * optional routes. `@Authenticate({ mfa: true })` needs `mfa: 'verified'`,
+ * and `@Authenticate({ verifiedEmail: true })` a verified address (403).
+ *
+ * Providers run once per call: the raw result is cached on the carrier
+ * (request, GraphQL `context.req`) or per ws message. With
+ * `@Authenticate({ providers })`, a cached result from another provider is
+ * ignored.
+ */
+@Injectable()
+export class AuthenticationGuard implements CanActivate {
+  /**
+   * How `@nestjs/authorization` recognizes this guard, subclasses included,
+   * whatever their names: it fails at startup when this guard would run
+   * after its own.
+   */
+  static readonly [AUTHENTICATION_GUARD_BRAND] = true;
+
+  constructor(
+    private readonly reflector: Reflector,
+    private readonly adapterHost: HttpAdapterHost,
+    private readonly registry: AuthenticationRegistry,
+  ) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const route = this.route(context);
+    if (route.public) {
+      // Nothing is written for http/graphql/rpc (another resolver of the same
+      // GraphQL operation may need the user); ws marks just this message.
+      if (context.getType() === 'ws') {
+        setAuthState(context, null, { perCallOnly: true });
+      }
+      return true;
+    }
+
+    const only = route.providers;
+    const all = this.registry.providers;
+    const providers = only ? all.filter((p) => only.some((type) => p instanceof type)) : all;
+
+    let raw = getRawResult(context);
+    if (only && raw && !providers.includes(producedBy.get(raw)!)) {
+      raw = undefined;
+    }
+    if (raw === undefined) {
+      raw = await this.authenticate(context, providers);
+      // A restricted run does not speak for the other routes sharing the carrier.
+      if (!only) {
+        setRawResult(context, raw);
+      }
+    }
+
+    const pending = raw?.mfa === 'pending';
+    const result = pending ? null : raw;
+    if (!result) {
+      if (route.optional) {
+        setAuthState(context, null);
+        return true;
+      }
+      if (pending) {
+        return this.fail(context, MFA_REQUIRED);
+      }
+      return this.fail(context, {}, this.challenges(context, providers));
+    }
+
+    if (route.mfa && result.mfa !== 'verified') {
+      return this.fail(context, MFA_REQUIRED);
+    }
+
+    if (route.verifiedEmail) {
+      const handler = this.registry.handler('emailVerification');
+      const verified = handler?.isVerified ? await handler.isVerified(result.user) : hasVerifiedEmail(result.user);
+      if (!verified) {
+        return this.fail(context, EMAIL_UNVERIFIED);
+      }
+    }
+
+    setAuthState(context, result);
+    return true;
+  }
+
+  /** Class options with the method's merged over them, field by field. */
+  private route(context: ExecutionContext): RouteAuthentication {
+    return {
+      ...this.reflector.get<RouteAuthentication | undefined>(AUTHENTICATION_METADATA, context.getClass()),
+      ...this.reflector.get<RouteAuthentication | undefined>(AUTHENTICATION_METADATA, context.getHandler()),
+    };
+  }
+
+  private async authenticate(
+    context: ExecutionContext,
+    providers: readonly Provider[],
+  ): Promise<AuthenticationResult<unknown, unknown> | null> {
+    for (const provider of providers) {
+      try {
+        const result = await provider.authenticate(context);
+        if (result?.user) {
+          producedBy.set(result, provider);
+          return result;
+        }
+      } catch (error) {
+        if (error instanceof AuthenticationError) {
+          const { status, message, code } = error;
+          return this.fail(context, { status, message, code, cause: error }, error.challenge);
+        }
+        throw error; // a store outage is a 500, not a 401
+      }
+    }
+    return null;
+  }
+
+  private challenges(context: ExecutionContext, providers: readonly Provider[]): string | undefined {
+    const list = providers.map((p) => p.challenge?.(context)).filter((c): c is string => !!c);
+    return list.join(', ') || undefined;
+  }
+
+  private async fail(context: ExecutionContext, reason: Refusal, challenge?: string): Promise<never> {
+    throw await refusal(context, reason, { challenge, adapterHost: this.adapterHost });
+  }
+}
