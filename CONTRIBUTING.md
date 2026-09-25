@@ -85,6 +85,7 @@ Before you submit your Pull Request (PR) consider the following guidelines:
 
 1. Create your patch, **including appropriate test cases**.
 1. Until @nestjs/authorization is published, build and pack ../authorization first
+1. Until @nestjs/idempotency is installed from npm here, build and pack ../idempotency first
   (`npm run build && npm pack` in a nestjs/authorization checkout next to this one); the
   interop tests install it from `../authorization/nestjs-authorization-0.0.1.tgz`.
 1. Follow our [Coding Rules](#rules).

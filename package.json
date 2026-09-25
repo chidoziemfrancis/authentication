@@ -51,6 +51,7 @@
     "@nestjs/core": "12.1.0",
     "@nestjs/drizzle": "0.0.1",
     "@nestjs/graphql": "14.0.1",
+    "@nestjs/idempotency": "file:../idempotency/nestjs-idempotency-0.0.1.tgz",
     "@nestjs/mail": "file:../mail/nestjs-mail-0.0.1.tgz",
     "@nestjs/microservices": "12.1.0",
     "@nestjs/platform-express": "12.1.0",
