@@ -16,6 +16,7 @@ import { SignInService } from '../session/sign-in.service.js';
 import type { MagicLinkOptions, MagicLinkRequest, CreatedMagicLink } from '../interfaces/magic-link.interface.js';
 import { MagicLinkError } from '../errors/magic-link.error.js';
 import { MagicLinkHandler } from './magic-link.handler.js';
+import { normalizeEmail } from '../account/email.util.js';
 
 /**
  * Passwordless sign-in links: 256-bit single-use tokens, stored hashed,
@@ -64,15 +65,21 @@ export class MagicLinkService {
    * Creates a link and hands it to `MagicLinkHandler.send()`. The token is
    * not returned. Called from an HTTP handler, it sets the transaction
    * cookie on the response (see `bindToBrowser`); the returned `cookie` is
-   * that `Set-Cookie` value, for callers outside HTTP.
+   * that `Set-Cookie` value, for callers outside HTTP. An `email` that isn't
+   * a non-blank string (a request body without it) creates and sends nothing,
+   * and gets the same answer, like `PasswordResetService.request()`.
    */
   async create(email: string, { redirectTo }: { redirectTo?: string } = {}): Promise<CreatedMagicLink> {
     const { options, handler } = this.feature();
-
-    const token = randomToken();
-    const normalized = email.trim().toLowerCase();
     const now = this.now();
     const expiresAt = new Date(now + this.ttl);
+
+    const normalized = typeof email === 'string' ? normalizeEmail(email) : '';
+    if (normalized === '') {
+      return { expiresAt };
+    }
+
+    const token = randomToken();
     const safe = safeRedirectPath(redirectTo);
     const id = sha256(token);
     await this.storage.magicLinks.saveMagicLink({
