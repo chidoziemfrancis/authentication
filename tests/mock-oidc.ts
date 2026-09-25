@@ -31,12 +31,17 @@ export interface ApproveOptions {
 
 /**
  * A minimal OpenID Provider on node:http: discovery, JWKS, token endpoint
- * (client_secret_basic, PKCE S256, redirect_uri and single-use code checks),
+ * (client_secret_basic, client_secret_post or a public client; PKCE S256, redirect_uri and
+ * single-use code checks),
  * userinfo, plus GitHub-style OAuth 2.0 endpoints under /gh.
  */
 export class MockOidcProvider {
   readonly clientId = 'nest-client';
   readonly clientSecret = 's3cr3t:with/special+chars';
+  /** A public client (PKCE only, no secret). */
+  readonly publicClientId = 'nest-public-client';
+  /** How each accepted token request authenticated the client. */
+  readonly clientAuthentications: ('client_secret_basic' | 'client_secret_post' | 'none')[] = [];
   issuer = '';
   private server?: Server;
   private rsa = { ...generateKeyPairSync('rsa', { modulusLength: 2048 }), kid: 'rsa-1' };
@@ -166,13 +171,19 @@ export class MockOidcProvider {
 
   private async token(req: IncomingMessage, _url: URL) {
     const form = new URLSearchParams(await body(req));
-    const [id, secret] = Buffer.from((req.headers.authorization ?? '').replace(/^Basic /, ''), 'base64')
-      .toString()
-      .split(':')
-      .map(decodeURIComponent);
-    if (id !== this.clientId || secret !== this.clientSecret) {
+    const basic = req.headers.authorization?.startsWith('Basic ');
+    const [id, secret] = basic
+      ? Buffer.from(req.headers.authorization!.replace(/^Basic /, ''), 'base64')
+          .toString()
+          .split(':')
+          .map(decodeURIComponent)
+      : [form.get('client_id') ?? '', form.get('client_secret') ?? undefined];
+    const method = basic ? 'client_secret_basic' : secret === undefined ? 'none' : 'client_secret_post';
+    const publicClient = method === 'none' && id === this.publicClientId;
+    if (!publicClient && (id !== this.clientId || secret !== this.clientSecret)) {
       return { status: 401, body: { error: 'invalid_client' } };
     }
+    this.clientAuthentications.push(method);
 
     const grant = this.codes.get(form.get('code') ?? '');
     this.codes.delete(form.get('code') ?? ''); // single use
@@ -200,7 +211,7 @@ export class MockOidcProvider {
 
     const idToken = signer.sign({
       iss: this.issuer,
-      aud: this.clientId,
+      aud: grant.clientId,
       sub: grant.sub,
       nonce: grant.nonce,
       email: `${grant.sub}@idp.test`,

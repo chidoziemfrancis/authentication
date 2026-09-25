@@ -553,6 +553,17 @@ describe.each(adapters.map((a) => a.name))('authentication e2e (%s)', (adapter) 
       }
     });
 
+    it('answers a request without a usable address like any other, and sends nothing', async () => {
+      const sent = outbox.length;
+
+      for (const body of [{}, { email: 42 }, { email: null }, { email: ['bob@example.com'] }, { email: '   ' }]) {
+        const res = await http().post('/auth/magic').send(body).expect(202);
+        expect(res.headers['set-cookie']).toBeUndefined();
+      }
+
+      expect(outbox).toHaveLength(sent);
+    });
+
     it('does not sign in unknown addresses', async () => {
       const { token: tokenParam, tx } = await requestLink('stranger@example.com');
       const res = await http().post('/auth/magic/consume').set('Cookie', tx).send({ token: tokenParam }).expect(401);
