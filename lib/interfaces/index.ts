@@ -1,3 +1,4 @@
+export * from './api-key.interface.js';
 export * from './authenticate-options.interface.js';
 export * from './authentication-error-options.interface.js';
 export * from './authentication-module-options.interface.js';

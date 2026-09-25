@@ -1,4 +1,6 @@
+export * from './api-key.util.js';
 export * from './auth-state.util.js';
+export * from './bearer.util.js';
 export * from './cross-origin.util.js';
 export * from './crypto.util.js';
 export * from './duration.util.js';

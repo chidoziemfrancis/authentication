@@ -18,6 +18,9 @@ export { WsAuthenticator } from './services/index.js';
 // Writing a credential provider
 export { AuthenticationProvider } from './providers/index.js';
 
+// API keys
+export { ApiKeyProvider } from './providers/index.js';
+
 // Errors: `AuthenticationError` is the base class of every error the package throws to apps
 export {
   AuthenticationError,
@@ -47,6 +50,9 @@ export {
 
 // Options, store contracts and public types
 export type {
+  ApiKeyProviderOptions,
+  ApiKeyRecord,
+  ApiKeySession,
   AuthenticateOptions,
   AuthenticationErrorOptions,
   AuthenticationHandlerName,
@@ -65,6 +71,7 @@ export type {
   EmailTokenStore,
   EmailVerificationLink,
   EmailVerificationOptions,
+  GeneratedApiKey,
   IssuedSession,
   IssueTokensOptions,
   JwksClientOptions,

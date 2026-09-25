@@ -23,7 +23,7 @@ export type MfaState = 'pending' | 'verified';
 
 export interface AuthenticationResult<TUser = AuthenticatedUser, TSession = AuthenticatedSession> {
   user: TUser;
-  /** Whatever the provider considers the session: a stored record, JWT claims, an API key row. */
+  /** Whatever the provider considers the session: a stored record, JWT claims, an `ApiKeySession`. */
   session?: TSession;
   mfa?: MfaState;
 }

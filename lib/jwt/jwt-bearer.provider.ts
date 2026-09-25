@@ -7,6 +7,8 @@ import { JwtError } from '../errors/jwt.error.js';
 import type { JwtClaims } from '../interfaces/jwt.interface.js';
 import type { JwtSignerOptions } from '../interfaces/jwt-options.interface.js';
 import type { JwtBearerProviderOptions } from '../interfaces/jwt-options.interface.js';
+import { API_KEY_PATTERN } from '../utils/api-key.util.js';
+import { bearerToken } from '../utils/bearer.util.js';
 import { hasMfaAmr } from './amr.util.js';
 import { JwtVerifier, verifierForSigner } from './jwt-verifier.service.js';
 
@@ -31,9 +33,10 @@ import { JwtVerifier, verifierForSigner } from './jwt-verifier.service.js';
  * tokens from another issuer, pass them: `super({ jwks, issuer, audience })`
  * (a `jwks` needs both `issuer` and `audience`).
  *
- * Over socket.io it also reads `handshake.auth.token`. `session` is the
- * verified claim set; an `amr` claim containing `mfa`, `otp` or `hwk` marks
- * the result as MFA-verified.
+ * Over socket.io it also reads `handshake.auth.token`. A token shaped like
+ * an API key (`ApiKeyProvider`) is left to the other providers. `session`
+ * is the verified claim set; an `amr` claim containing `mfa`, `otp` or
+ * `hwk` marks the result as MFA-verified.
  */
 export abstract class JwtBearerProvider<TUser> extends AuthenticationProvider<TUser, JwtClaims> {
   @Optional()
@@ -111,24 +114,12 @@ export abstract class JwtBearerProvider<TUser> extends AuthenticationProvider<TU
   }
 
   private extract(context: ExecutionContext): string | undefined {
-    const authorization = this.header(context, 'authorization');
-    if (authorization) {
-      const [scheme, token, ...rest] = authorization.trim().split(/\s+/);
-      if (scheme.toLowerCase() !== 'bearer') {
-        return undefined; // another provider's scheme
-      }
-      if (!token || rest.length) {
-        this.reject('malformed authorization header');
-      }
-      return token;
+    const token = bearerToken(context, this.header(context, 'authorization'));
+    if (token === null) {
+      this.reject('malformed authorization header');
     }
-
-    if (context.getType() === 'ws') {
-      const token = context.switchToWs().getClient()?.handshake?.auth?.token;
-      return typeof token === 'string' ? token : undefined;
-    }
-
-    return undefined;
+    // An API key is `ApiKeyProvider`'s, which may run after this one.
+    return token === undefined || API_KEY_PATTERN.test(token) ? undefined : token;
   }
 
   private reject(description: string): never {

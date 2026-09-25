@@ -140,8 +140,9 @@ export class AuthenticationGuard implements CanActivate {
   }
 
   private challenges(context: ExecutionContext, providers: readonly Provider[]): string | undefined {
-    const list = providers.map((p) => p.challenge?.(context)).filter((c): c is string => !!c);
-    return list.join(', ') || undefined;
+    // Once each: a JWT and an API key provider in one realm accept the same `Bearer realm="…"`.
+    const list = new Set(providers.map((p) => p.challenge?.(context)).filter((c): c is string => !!c));
+    return [...list].join(', ') || undefined;
   }
 
   private async fail(context: ExecutionContext, reason: Refusal, challenge?: string): Promise<never> {
