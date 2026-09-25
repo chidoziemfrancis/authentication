@@ -21,14 +21,6 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/nestjs/mail.git ../mail
           cd ../mail && npm install && npm run build && npm pack
-      - name: Build and pack @nestjs/resilience
-        run: |
-          git clone --depth 1 https://github.com/nestjs/resilience.git ../resilience
-          cd ../resilience && npm install && npm run build && npm pack
-      - name: Build and pack @nestjs/idempotency
-        run: |
-          git clone --depth 1 https://github.com/nestjs/idempotency.git ../idempotency
-          cd ../idempotency && npm install && npm run build && npm pack
       - run: npm install
       - run: npm run build
       - run: npm run lint
@@ -72,14 +64,6 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/nestjs/mail.git ../mail
           cd ../mail && npm install && npm run build && npm pack
-      - name: Build and pack @nestjs/resilience
-        run: |
-          git clone --depth 1 https://github.com/nestjs/resilience.git ../resilience
-          cd ../resilience && npm install && npm run build && npm pack
-      - name: Build and pack @nestjs/idempotency
-        run: |
-          git clone --depth 1 https://github.com/nestjs/idempotency.git ../idempotency
-          cd ../idempotency && npm install && npm run build && npm pack
       - name: Install dependencies
         run: npm install
       - name: Install NestJS ${{ matrix.nestjs-version }}
