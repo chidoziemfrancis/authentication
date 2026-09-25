@@ -228,7 +228,7 @@ describe('AuthenticationStorage in an app', () => {
       AuthenticationModule.forRoot({
         accessToken: { key: KEY },
         mfa: { encryption: false },
-        magicLink: { url: 'https://acme.test/magic' },
+        magicLink: { url: 'https://example.com/magic' },
       }),
       StoresModule,
     ], [Sessions, Bearer, MagicLinks]);
@@ -367,7 +367,7 @@ describe('the production guard', () => {
 
     // Magic links sign browsers in: sessions, pending links, and `mfa` (registered here) for the authenticator check.
     await expect(
-      start([AuthenticationModule.forRoot({ magicLink: { url: 'https://acme.test/magic' } }), SqlModule], [MagicLinks]),
+      start([AuthenticationModule.forRoot({ magicLink: { url: 'https://example.com/magic' } }), SqlModule], [MagicLinks]),
     ).rejects.toThrow('no store is registered for `sessions` (SessionStore) and `magicLinks` (MagicLinkStore), and NODE_ENV');
   });
 

@@ -88,8 +88,8 @@ describe('AuthenticationModule registration', () => {
   });
 
   it('forRoot() takes plain values, which the options token holds', async () => {
-    app = await boot(AuthenticationModule.forRoot({ session: { cookieName: 'acme', idleTtl: '1h' } }));
-    expect(app.get(AUTHENTICATION_MODULE_OPTIONS)).toEqual({ session: { cookieName: 'acme', idleTtl: '1h' } });
+    app = await boot(AuthenticationModule.forRoot({ session: { cookieName: 'session', idleTtl: '1h' } }));
+    expect(app.get(AUTHENTICATION_MODULE_OPTIONS)).toEqual({ session: { cookieName: 'session', idleTtl: '1h' } });
     await request(app.getHttpServer()).get('/me').set('X-User', 'u1').expect(200, { id: 'u1' });
     await request(app.getHttpServer()).get('/me').expect(401);
   });
@@ -275,7 +275,7 @@ describe('AuthenticationRegistry', () => {
         }
       }
 
-      const registry = new AuthenticationRegistry({ magicLink: { url: 'https://acme.test/magic' } });
+      const registry = new AuthenticationRegistry({ magicLink: { url: 'https://example.com/magic' } });
       const first = new Links();
       registry.registerHandler('magicLink', first);
 
@@ -321,7 +321,7 @@ describe('AuthenticationRegistry', () => {
         },
       };
 
-      const moduleRef = await start([AuthenticationModule.forRoot({ magicLink: { url: 'https://acme.test/magic' } })], [
+      const moduleRef = await start([AuthenticationModule.forRoot({ magicLink: { url: 'https://example.com/magic' } })], [
         answering('api', 1),
         HeaderAuth,
         handlers,
@@ -408,7 +408,7 @@ describe('startup checks', () => {
       '`mfa.encryption.keys[0]` is required (32 random bytes, or a random string of at least 32 characters), but it is undefined',
     );
 
-    const callbackUrl = 'https://acme.test/auth/oidc/:provider/callback';
+    const callbackUrl = 'https://example.com/auth/oidc/:provider/callback';
     await expect(forRoot({ oidc: { callbackUrl, providers: { google: google({ clientId: unset!, clientSecret: 's' }) } } })).rejects.toThrow(
       '`oidc.providers.google.clientId` is required (the client id the provider issued), but it is undefined',
     );
@@ -428,13 +428,13 @@ describe('startup checks', () => {
   });
 
   it("a feature's option without its handler fails at startup, and so does a handler without its option", async () => {
-    await expect(start(AuthenticationModule.forRoot({ magicLink: { url: 'https://acme.test/magic' } }))).rejects.toThrow(
+    await expect(start(AuthenticationModule.forRoot({ magicLink: { url: 'https://example.com/magic' } }))).rejects.toThrow(
       'AuthenticationModule: `magicLink` is configured, but no MagicLinkHandler is registered.',
     );
     await expect(
       start(
         AuthenticationModule.forRootAsync({
-          useFactory: () => ({ oidc: { callbackUrl: 'https://acme.test/auth/oidc/:provider/callback', providers: {} } }),
+          useFactory: () => ({ oidc: { callbackUrl: 'https://example.com/auth/oidc/:provider/callback', providers: {} } }),
         }),
       ),
     ).rejects.toThrow('AuthenticationModule: `oidc` is configured, but no OidcAccountResolver is registered.');

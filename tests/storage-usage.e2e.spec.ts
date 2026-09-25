@@ -168,8 +168,8 @@ const FAMILY = (): Setup => ({
   handlers: { passwordReset: new ResetMailer(), emailVerification: new VerificationMailer() },
   options: {
     accessToken: { key: KEY },
-    passwordReset: { url: 'https://acme.test/reset' },
-    emailVerification: { url: 'https://acme.test/verify' },
+    passwordReset: { url: 'https://example.com/reset' },
+    emailVerification: { url: 'https://example.com/verify' },
   },
 });
 
@@ -306,7 +306,7 @@ describe('the production guard and what the features read', () => {
         contracts: ['mfa'],
         flows: async (app) => {
           const mfa = app.get(MfaService);
-          const { secret } = await mfa.enroll('u1', 'u1@acme.test');
+          const { secret } = await mfa.enroll('u1', 'u1@example.com');
           const code = hotp(base32Decode(secret), totpStep(Math.floor(Date.now() / 1000)));
           expect(await mfa.confirm('u1', code)).toBe(true);
           expect(await mfa.isEnrolled('u1')).toBe(true);
@@ -320,18 +320,18 @@ describe('the production guard and what the features read', () => {
       },
       {
         feature: 'magicLink',
-        options: () => ({ handlers: { magicLink: new Links() }, options: { magicLink: { url: 'https://acme.test/magic' } } }),
+        options: () => ({ handlers: { magicLink: new Links() }, options: { magicLink: { url: 'https://example.com/magic' } } }),
         contracts: ['sessions', 'mfa', 'magicLinks'],
         flows: async (app, world) => {
           const links = app.get(MagicLinkService);
           // Outside HTTP: the browser's transaction cookie is passed by hand.
           const browser = (cookie?: string) => ({ request: { headers: { cookie: cookie?.split(';')[0] } } });
 
-          const first = await links.create('u1@acme.test');
+          const first = await links.create('u1@example.com');
           expect(await links.consume(tokenOf(magicLinks), browser(first.cookie))).toMatchObject({ session: { userId: 'u1' } });
 
           await enrolled(world);
-          const second = await links.create('enrolled@acme.test');
+          const second = await links.create('enrolled@example.com');
           expect(await links.consume(tokenOf(magicLinks), browser(second.cookie))).toMatchObject({
             session: { userId: 'enrolled', mfa: 'pending' },
           });
@@ -343,7 +343,7 @@ describe('the production guard and what the features read', () => {
           handlers: { oidc: new Accounts() },
           options: {
             oidc: {
-              callbackUrl: 'https://acme.test/auth/oidc/:provider/callback',
+              callbackUrl: 'https://example.com/auth/oidc/:provider/callback',
               providers: { mock: { issuer: idp.issuer, clientId: idp.clientId, clientSecret: idp.clientSecret } },
             },
           },
@@ -365,18 +365,18 @@ describe('the production guard and what the features read', () => {
         feature: 'passwordReset',
         options: () => ({
           handlers: { passwordReset: new Resets() },
-          options: { passwordReset: { url: 'https://acme.test/reset' }, password: { logN: 10 } },
+          options: { passwordReset: { url: 'https://example.com/reset' }, password: { logN: 10 } },
         }),
         contracts: ['sessions', 'refreshTokens', 'mfa', 'emailTokens'],
         flows: async (app, world) => {
           const resets = app.get(PasswordResetService);
 
-          resets.request('u1@acme.test');
+          resets.request('u1@example.com');
           await resets.onModuleDestroy();
           expect(await resets.reset(tokenOf(resetLinks), 'a new password')).toEqual({ userId: 'u1' });
 
           await enrolled(world);
-          resets.request('enrolled@acme.test');
+          resets.request('enrolled@example.com');
           await resets.onModuleDestroy();
           const result = await resets.reset(tokenOf(resetLinks), 'a new password', { signIn: true });
           expect(result?.signedIn?.session.mfa).toBe('pending');
@@ -386,13 +386,13 @@ describe('the production guard and what the features read', () => {
         feature: 'emailVerification',
         options: () => ({
           handlers: { emailVerification: new Verifications() },
-          options: { emailVerification: { url: 'https://acme.test/verify' } },
+          options: { emailVerification: { url: 'https://example.com/verify' } },
         }),
         contracts: ['emailTokens'],
         flows: async (app) => {
           const verification = app.get(EmailVerificationService);
-          await verification.send({ id: 'u1', email: 'u1@acme.test' });
-          expect(await verification.verify(tokenOf(verificationLinks))).toEqual({ userId: 'u1', email: 'u1@acme.test' });
+          await verification.send({ id: 'u1', email: 'u1@example.com' });
+          expect(await verification.verify(tokenOf(verificationLinks))).toEqual({ userId: 'u1', email: 'u1@example.com' });
         },
       },
     ];

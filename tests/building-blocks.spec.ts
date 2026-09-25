@@ -454,7 +454,7 @@ describe('SessionService', () => {
 
   it('judges cross-origin writes as app.enableCsrfProtection() does', () => {
     const token = 'A'.repeat(43);
-    const { sessions } = setup({ cookie: { secure: false }, trustedOrigins: ['https://App.Acme.test:443'] });
+    const { sessions } = setup({ cookie: { secure: false }, trustedOrigins: ['https://Shop.Example.com:443'] });
     const post = (headers: Record<string, string>) =>
       sessions.tokenFrom({ method: 'POST', headers: { cookie: `sid=${token}`, ...headers } });
 
@@ -469,15 +469,15 @@ describe('SessionService', () => {
     expect(post({ host: 'api.test', origin: 'https://api.test', 'sec-fetch-site': 'same-site' })).toBeUndefined();
 
     // Trusted origins are added to the request's own, and normalized like the browser's `Origin`.
-    expect(post({ host: 'api.test', origin: 'https://app.acme.test', 'sec-fetch-site': 'same-site' })).toBe(token);
+    expect(post({ host: 'api.test', origin: 'https://shop.example.com', 'sec-fetch-site': 'same-site' })).toBe(token);
     expect(post({ host: 'api.test', origin: 'https://evil.test', 'sec-fetch-site': 'cross-site' })).toBeUndefined();
 
     // A WebSocket handshake (no method) opens a channel for writes: same rule (cross-site WebSocket hijacking).
     expect(sessions.tokenFrom({ headers: { cookie: `sid=${token}`, host: 'api.test', origin: 'https://evil.test' } })).toBeUndefined();
     expect(sessions.tokenFrom({ headers: { cookie: `sid=${token}`, host: 'api.test', origin: 'https://api.test' } })).toBe(token);
 
-    expect(() => setup({ trustedOrigins: ['https://app.acme.test/'] })).toThrow(
-      'session.trustedOrigins: "https://app.acme.test/" is not an origin. Write it as scheme://host[:port], without a path.',
+    expect(() => setup({ trustedOrigins: ['https://shop.example.com/'] })).toThrow(
+      'session.trustedOrigins: "https://shop.example.com/" is not an origin. Write it as scheme://host[:port], without a path.',
     );
   });
 
@@ -490,12 +490,12 @@ describe('SessionService', () => {
     expect(secure.sessions.tokenFrom({ method: 'GET', headers: { cookie: `__Host-sid=${token}` } })).toBe(token);
 
     // Plain HTTP (`secure: false`), a `domain` or a `path` rule the prefix out.
-    for (const cookie of [{ secure: false }, { domain: 'acme.test' }, { path: '/api' }]) {
+    for (const cookie of [{ secure: false }, { domain: 'example.com' }, { path: '/api' }]) {
       expect((await setup({ cookie }).sessions.create('u1')).cookie).toMatch(/^sid=/);
     }
 
-    expect((await setup({ cookieName: 'acme' }).sessions.create('u1')).cookie).toMatch(/^acme=/);
-    expect(() => setup({ cookieName: '__Host-acme', cookie: { domain: 'acme.test' } })).toThrow(
+    expect((await setup({ cookieName: 'session' }).sessions.create('u1')).cookie).toMatch(/^session=/);
+    expect(() => setup({ cookieName: '__Host-session', cookie: { domain: 'example.com' } })).toThrow(
       'session.cookieName: browsers drop a __Host- cookie unless it is Secure, with Path=/ and no Domain.',
     );
   });
