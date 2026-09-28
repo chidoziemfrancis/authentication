@@ -22,7 +22,11 @@ export interface JwksClientOptions {
 export interface JwtVerifierOptions extends ClaimRules {
   /**
    * A static key: an HS256 secret (at least 32 bytes), or a public or
-   * private key as a `KeyObject` or PEM text (a string or a `Buffer`).
+   * private key as a `KeyObject` or PEM text (a string or a `Buffer`). A
+   * public key needs `issuer` and `audience`, as a `jwks` does: it is an
+   * identity provider's, which signs the tokens of all its clients with it.
+   * A JWK, or DER, is refused (read as bytes, it would be an HS256 secret):
+   * pass `createPublicKey({ key: jwk, format: 'jwk' })`.
    */
   key?: KeyObject | string | Buffer;
   /**
@@ -44,7 +48,8 @@ export interface JwtVerifierOptions extends ClaimRules {
 export interface JwtSignerOptions {
   /**
    * An HS256 secret (at least 32 bytes), or a private key for RS256, ES256
-   * or EdDSA: a `KeyObject`, or PEM text (a string or a `Buffer`).
+   * or EdDSA: a `KeyObject`, or PEM text (a string or a `Buffer`). A JWK, or
+   * DER, is refused: pass `createPrivateKey({ key: jwk, format: 'jwk' })`.
    */
   key: KeyObject | string | Buffer;
   /** Default: HS256 for a secret, the key's own algorithm for a private key. */

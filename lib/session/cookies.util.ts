@@ -1,4 +1,12 @@
 /**
+ * Only the whitespace browsers strip around a cookie's name and value (RFC
+ * 6265 §5.2): space and tab. `String.prototype.trim()` would also strip
+ * U+00A0 and U+FEFF, so a sibling subdomain could plant `\xA0__Host-sid`,
+ * which browsers store as an unprefixed name, and have it read as `__Host-sid`.
+ */
+const trimSpaces = (text: string) => text.replace(/^[ \t]+|[ \t]+$/g, '');
+
+/**
  * Reads one cookie from a raw `Cookie` header (RFC 6265 §5.4), so neither
  * `cookie-parser` nor `@fastify/cookie` is needed. The first occurrence
  * wins, as browsers send the most specific path first.
@@ -13,11 +21,11 @@ export function readCookie(header: string | undefined, name: string): string | u
     if (eq === -1) {
       continue;
     }
-    if (pair.slice(0, eq).trim() !== name) {
+    if (trimSpaces(pair.slice(0, eq)) !== name) {
       continue;
     }
 
-    let value = pair.slice(eq + 1).trim();
+    let value = trimSpaces(pair.slice(eq + 1));
     if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
       value = value.slice(1, -1);
     }

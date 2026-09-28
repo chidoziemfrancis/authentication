@@ -130,7 +130,7 @@ class PasswordResetMailer extends PasswordResetHandler {
     lookupStarted = true;
     await lookupGate;
     const row = this.accounts.byEmail(email);
-    return row ? { id: row.id, passwordHash: row.passwordHash } : null;
+    return row ? { id: row.id, email: row.email, passwordHash: row.passwordHash } : null;
   }
   async send(link: PasswordResetLink) {
     await this.mailer.send(PasswordResetMail, { to: link.email, data: link });

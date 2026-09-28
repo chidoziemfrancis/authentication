@@ -23,7 +23,7 @@ import {
   AuthenticationProvider,
   AuthenticationRegistry,
   CurrentUser,
-} from '@nestjs/authentication';
+} from '../lib/index.js';
 import { AuthorizationModule, AuthorizationService, Policy } from '@nestjs/authorization';
 import { ResilienceModule, Retry } from '@nestjs/resilience';
 import { adapters, createApp, type AdapterName } from './support/adapters.js';

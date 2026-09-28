@@ -119,8 +119,10 @@ export interface AuthenticationEmailVerifiedEvent {
  * else, on another device, or planted by whoever requested it (login CSRF);
  * it stays usable where it was requested, and `consume()` threw a
  * `MagicLinkError`. The others are its `null`: `unknown`: malformed, used,
- * or never issued. `expired`: past `magicLink.ttl`. `refused`:
- * `MagicLinkHandler.resolveUser()` returned `null`.
+ * never issued, or presented with a cookie whose secret is not the link's.
+ * `expired`: past `magicLink.ttl`. `refused`:
+ * `MagicLinkHandler.resolveUser()` returned `null`, or an account whose
+ * stored address is not the one the link was sent to.
  */
 export interface AuthenticationMagicLinkRefusedEvent {
   type: 'magic-link-refused';

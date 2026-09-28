@@ -6,6 +6,7 @@ import { TokenService } from '../jwt/token.service.js';
 import { MfaService } from '../mfa/mfa.service.js';
 import type { IssuedSession } from '../interfaces/session.interface.js';
 import type { SignInOptions } from '../interfaces/sign-in-options.interface.js';
+import { sha256 } from '../utils/crypto.util.js';
 import { SessionService } from './session.service.js';
 
 /**
@@ -42,9 +43,7 @@ export class SignInService {
    */
   async signIn(userId: string, { method, metadata }: SignInOptions = {}): Promise<IssuedSession> {
     const exchange = this.scope.exchange();
-    if (exchange && this.sessions.isCrossOriginWrite(exchange.request)) {
-      throw new ForbiddenException('Cross-origin sign-in refused');
-    }
+    this.refuseCrossOrigin(exchange?.request);
 
     const mfa = (await this.mfa.isEnrolled(userId)) ? 'pending' : undefined;
     const stored = { ...this.sessions.metadataFor(exchange?.request), ...metadata };
@@ -92,8 +91,11 @@ export class SignInService {
       return null;
     }
 
+    // A revocation that took the session meanwhile wins: no verified session comes of it.
     const issued = await this.sessions.rotate(session, { mfa: 'verified' });
-    this.setCookie(exchange, issued.cookie);
+    if (issued) {
+      this.setCookie(exchange, issued.cookie);
+    }
     return issued;
   }
 
@@ -115,7 +117,9 @@ export class SignInService {
     const session = await this.sessions.validate(this.sessions.tokenFrom(exchange?.request));
     if (session?.userId === userId) {
       const issued = await this.sessions.rotate(session, { mfa: 'verified' });
-      this.setCookie(exchange, issued.cookie);
+      if (issued) {
+        this.setCookie(exchange, issued.cookie);
+      }
     }
 
     return true;
@@ -124,7 +128,8 @@ export class SignInService {
   /**
    * Gives this browser's session a new id, keeping its user, expiry and
    * second factor, and updates the cookie. Call it on privilege changes: a
-   * new password, a new role. `null` when the browser has no session.
+   * new password, a new role. `null` when the browser has no session, or
+   * lost it meanwhile (revoked, or rotated by another request).
    */
   async rotateSession(): Promise<IssuedSession | null> {
     const exchange = this.scope.exchange();
@@ -133,7 +138,9 @@ export class SignInService {
       return null;
     }
     const issued = await this.sessions.rotate(session);
-    this.setCookie(exchange, issued.cookie);
+    if (issued) {
+      this.setCookie(exchange, issued.cookie);
+    }
     return issued;
   }
 
@@ -151,18 +158,21 @@ export class SignInService {
 
     const session = await this.sessions.validate(token);
     this.setCookie(exchange, this.sessions.clearCookie());
+    // Deleted whatever this instance makes of it: idle here, it may still be live for another
+    // instance (its clock, or another idleTtl during a rolling deploy).
+    await this.sessions.discard(sha256(token));
     if (!session) {
       return false;
     }
 
-    await this.sessions.discard(session.id);
     this.events.emit({ type: 'sign-out', userId: session.userId, sessionId: session.id });
     return true;
   }
 
   /**
    * Ends every session and refresh-token family of the user, and clears
-   * this browser's cookie if it was one of them.
+   * this browser's cookie if it was one of them. API keys live in your own
+   * table: revoke those yourself.
    */
   async signOutEverywhere(userId: string): Promise<void> {
     const exchange = this.scope.exchange();
@@ -173,6 +183,18 @@ export class SignInService {
       this.setCookie(exchange, this.sessions.clearCookie());
     }
     this.events.emit({ type: 'sign-out', userId, everywhere: true });
+  }
+
+  /**
+   * @internal The 403 `signIn()` answers a request that changes state from
+   * another origin than the app's own and `session.trustedOrigins` with.
+   * What binds a sign-in to a browser (a magic link's `create()`) checks it
+   * too: another site's page must not start one in the victim's browser.
+   */
+  refuseCrossOrigin(request: HttpExchange['request'] | undefined): void {
+    if (request && this.sessions.isCrossOriginWrite(request)) {
+      throw new ForbiddenException('Cross-origin sign-in refused');
+    }
   }
 
   private setCookie(exchange: HttpExchange | undefined, cookie: string) {

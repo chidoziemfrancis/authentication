@@ -33,10 +33,17 @@ const EMAIL_UNVERIFIED: Refusal = { status: 403, message: 'Email address not ver
  * optional routes. `@Authenticate({ mfa: true })` needs `mfa: 'verified'`,
  * and `@Authenticate({ verifiedEmail: true })` a verified address (403).
  *
- * Providers run once per call: the raw result is cached on the carrier
- * (request, GraphQL `context.req`) or per ws message. With
+ * Providers run once per call: the raw result is cached on the request, the
+ * GraphQL operation's context, or per ws message. With
  * `@Authenticate({ providers })`, a cached result from another provider is
  * ignored.
+ *
+ * Where Nest runs no global guard, neither does this one: on GraphQL field
+ * resolvers (`@ResolveField`), unless the GraphQL module sets
+ * `fieldResolverEnhancers: ['guards']`, and on the message handlers of a
+ * hybrid app, unless it connects them with
+ * `app.connectMicroservice(options, { inheritAppConfig: true })`. There,
+ * route options are not enforced.
  */
 @Injectable()
 export class AuthenticationGuard implements CanActivate {
@@ -73,7 +80,7 @@ export class AuthenticationGuard implements CanActivate {
       raw = undefined;
     }
     if (raw === undefined) {
-      raw = await this.authenticate(context, providers);
+      raw = await this.authenticate(context, providers, !only);
       // A restricted run does not speak for the other routes sharing the carrier.
       if (!only) {
         setRawResult(context, raw);
@@ -86,6 +93,9 @@ export class AuthenticationGuard implements CanActivate {
       if (route.optional) {
         setAuthState(context, null);
         return true;
+      }
+      if (!only) {
+        this.forgetConnection(context);
       }
       if (pending) {
         return this.fail(context, MFA_REQUIRED);
@@ -120,6 +130,7 @@ export class AuthenticationGuard implements CanActivate {
   private async authenticate(
     context: ExecutionContext,
     providers: readonly Provider[],
+    everyProvider: boolean,
   ): Promise<AuthenticationResult<unknown, unknown> | null> {
     for (const provider of providers) {
       try {
@@ -130,6 +141,9 @@ export class AuthenticationGuard implements CanActivate {
         }
       } catch (error) {
         if (error instanceof AuthenticationError) {
+          if (everyProvider || error.status === 401) {
+            this.forgetConnection(context);
+          }
           const { status, message, code } = error;
           return this.fail(context, { status, message, code, cause: error }, error.challenge);
         }
@@ -137,6 +151,18 @@ export class AuthenticationGuard implements CanActivate {
       }
     }
     return null;
+  }
+
+  /**
+   * A ws socket keeps its last user (`client.user`) for code that reads it,
+   * `@nestjs/authorization` among it, on messages that run no provider
+   * (`@Public()`): a message refused for its credentials says the connection
+   * has none now, its session revoked or its token expired.
+   */
+  private forgetConnection(context: ExecutionContext) {
+    if (context.getType() === 'ws') {
+      setAuthState(context, null);
+    }
   }
 
   private challenges(context: ExecutionContext, providers: readonly Provider[]): string | undefined {

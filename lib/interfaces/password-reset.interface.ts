@@ -5,6 +5,14 @@ import type { IssuedSession } from './session.interface.js';
 export interface PasswordResetAccount {
   id: string;
   /**
+   * The address the account has stored. The link goes there, never to the
+   * address typed in the form: a lookup that ignores accents or dots (MySQL's
+   * default collation does) would otherwise mail `victim@example.com`'s link
+   * to whoever typed `victim@exämple.com`. A link works only while the
+   * account keeps this address.
+   */
+  email: string;
+  /**
    * The stored password hash, or `null` for an account without a password
    * (a reset then sets one). A link only works while this is unchanged, so
    * any password change invalidates the links sent before it.

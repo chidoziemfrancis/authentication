@@ -257,7 +257,7 @@ class ResetMailer extends PasswordResetHandler {
   }
   findUser(email: string) {
     const row = this.accounts.byEmail(email);
-    return row ? { id: row.id, passwordHash: row.passwordHash } : null;
+    return row ? { id: row.id, email: row.email, passwordHash: row.passwordHash } : null;
   }
   send(link: PasswordResetLink) {
     mails.push(link);
@@ -615,11 +615,14 @@ for (const target of targets) {
         const tx = cookieOf(requested, '__Host-magic_link_tx')!;
         const token = tokenOf(mails.at(-1)!);
 
-        expect(await rows('SELECT id, email FROM magic_links WHERE id = $1', sha256(token))).toEqual([{ id: sha256(token), email: user.email }]);
+        // Stored under the token and the browser's secret together: the link alone finds no row.
+        const id = sha256(`${token}.${valueOf(tx).split('.')[1]}`);
+        expect(await rows('SELECT id, email FROM magic_links WHERE id = $1', id)).toEqual([{ id, email: user.email }]);
+        expect(await rows('SELECT id FROM magic_links WHERE id = $1', sha256(token))).toEqual([]);
 
         const consumed = await http().post('/magic/consume').set('Cookie', tx).send({ token }).expect(200);
         await http().get('/me').set('Cookie', cookieOf(consumed, '__Host-sid')!).expect(200, { id: user.id });
-        expect(await rows('SELECT id FROM magic_links WHERE id = $1', sha256(token))).toEqual([]);
+        expect(await rows('SELECT id FROM magic_links WHERE id = $1', id)).toEqual([]);
         await http().post('/magic/consume').set('Cookie', tx).send({ token }).expect(401);
       });
 

@@ -7,6 +7,16 @@ export interface MagicLink {
   expiresAt: Date;
 }
 
+/** The account behind an address, as `MagicLinkHandler.resolveUser()` returns it. */
+export interface MagicLinkAccount {
+  id: string;
+  /**
+   * The address the account has stored. The link signs the account in only
+   * when it is the link's address (compared trimmed and lowercased).
+   */
+  email: string;
+}
+
 export interface MagicLinkOptions {
   /** Page that receives `?token=…`, e.g. `https://app.example.com/auth/magic`. */
   url: string;

@@ -130,9 +130,10 @@ export function authenticationStoreContract(
     same(sortIds(await store.listUserSessions(u1)), [full.id, bare.id].sort(), "listUserSessions() returns the user's sessions");
     same(await store.listUserSessions(uid()), [], 'listUserSessions() of a user without sessions');
 
-    await store.deleteSession(bare.id);
+    same(await store.deleteSession(bare.id), true, 'deleteSession() resolves true when it deleted the session');
     same(await store.getSession(bare.id), undefined, 'deleteSession() deletes');
-    await store.deleteSession(bare.id); // idempotent
+    same(await store.deleteSession(bare.id), false, 'deleteSession() of a session already gone resolves false');
+    same(await store.deleteSession(id()), false, 'deleteSession() of an unknown id resolves false');
     await store.deleteUserSessions(u1);
     same(await store.listUserSessions(u1), [], "deleteUserSessions() deletes the user's sessions");
     same(await store.getSession(other.id), other, "deleteUserSessions() leaves other users' sessions alone");
@@ -219,6 +220,41 @@ export function authenticationStoreContract(
           later(1, () => sessions.validate(rotated.token)),
         ]);
         same(await sessions.validate(rotated.token), null, 'a session validated during its rotation stays deleted');
+      }
+    },
+    concurrent,
+  );
+
+  add(
+    'sessions',
+    'of concurrent deletes of one session, exactly one resolves true (what keeps a rotation from outliving a revocation)',
+    async ({ sessions: store }) => {
+      for (let round = 0; round < 3; round++) {
+        const record = session(uid());
+        await store.createSession(record);
+        const results = await Promise.all(Array.from({ length: 6 }, (_, i) => later(i % 3, () => store.deleteSession(record.id))));
+        same(results.filter((deleted) => deleted === true).length, 1, 'one deleteSession() call deleted it, the others found it gone');
+      }
+    },
+    concurrent,
+  );
+
+  add(
+    'sessions',
+    'a rotation racing a sign-out leaves no session, and concurrent rotations leave one (SessionService)',
+    async (sources) => {
+      const sessions = new SessionService(storageOf(sources, 'sessions'), { session: { idleTtl: '1m', absoluteTtl: '5m', touchInterval: '10s' } });
+      for (const delay of [0, 1, 2, 3]) {
+        const user = uid();
+        const { session: revoked } = await sessions.create(user);
+        await Promise.all([sessions.rotate(revoked), later(delay, () => sessions.revokeAll(user))]);
+        same(await sessions.list(user), [], 'no session outlives "sign out everywhere", rotated or not');
+
+        const other = uid();
+        const { session: forked } = await sessions.create(other);
+        const rotations = await Promise.all([sessions.rotate(forked), later(delay, () => sessions.rotate(forked))]);
+        same(rotations.filter((issued) => issued !== null).length, 1, 'one of two concurrent rotations wins');
+        same((await sessions.list(other)).length, 1, 'a session rotated twice at once does not fork');
       }
     },
     concurrent,
@@ -610,7 +646,7 @@ export function authenticationStoreContract(
 
       const resets = new (class extends PasswordResetHandler {
         findUser(email: string) {
-          return email === account.email ? { id: account.id, passwordHash: account.passwordHash } : null;
+          return email === account.email ? { id: account.id, email: account.email, passwordHash: account.passwordHash } : null;
         }
         send({ url }: { url: string }) {
           mails.push(url);

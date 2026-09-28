@@ -85,7 +85,7 @@ class PasswordResetMailer extends PasswordResetHandler {
     registry.registerHandler('passwordReset', this);
   }
   findUser(email: string) {
-    return { id: email.split('@')[0], passwordHash: null };
+    return { id: email.split('@')[0], email, passwordHash: null };
   }
   send(link: PasswordResetLink) {
     this.smtpClient.send(link.email);
@@ -151,7 +151,7 @@ describe.each(adapters.map((a) => a.name))('testing an app, the README’s way (
   let app: INestApplication;
   const fakeMailer = { sent: [] as PasswordResetLink[] };
   const fake = Object.assign(Object.create(PasswordResetHandler.prototype) as PasswordResetHandler, {
-    findUser: (email: string) => ({ id: email.split('@')[0], passwordHash: null }),
+    findUser: (email: string) => ({ id: email.split('@')[0], email, passwordHash: null }),
     send: (link: PasswordResetLink) => void fakeMailer.sent.push(link),
     updatePassword: () => {},
   });
@@ -235,7 +235,7 @@ describe('fake handlers', () => {
     moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
     const registry = moduleRef.get(AuthenticationRegistry);
     const replacement = Object.assign(Object.create(PasswordResetHandler.prototype) as PasswordResetHandler, {
-      findUser: (email: string) => ({ id: email, passwordHash: null }),
+      findUser: (email: string) => ({ id: email, email, passwordHash: null }),
       send: (link: PasswordResetLink) => void sent.push(link),
       updatePassword: () => {},
     });

@@ -3,6 +3,7 @@
  * link URLs, expiry boundaries, what each refusal leaves behind, purposes kept apart, and the
  * requests the module waits for on shutdown.
  */
+import { Logger } from '@nestjs/common';
 import {
   AuthenticationEvents,
   EmailVerificationHandler,
@@ -60,15 +61,24 @@ function verificationWith(options: { url?: string; ttl?: string } = {}) {
 }
 
 describe('EmailVerificationService', () => {
-  it('sends the normalized address, and a link that keeps the page’s own query parameters', async () => {
+  it('sends the address as the account has it, and a link that keeps the page’s own query parameters', async () => {
     const { service, mailer } = verificationWith({ url: 'https://app.test/verify?lang=pl' });
-    const { expiresAt } = await service.send({ id: 'u1', email: '  Ada@Example.COM ' });
+    const { expiresAt } = await service.send({ id: 'u1', email: 'Ada@Example.COM' });
 
     expect(expiresAt).toEqual(new Date(T0 + 86_400_000));
-    expect(mailer.sent).toEqual([{ userId: 'u1', email: 'ada@example.com', url: expect.any(String), expiresAt }]);
+    expect(mailer.sent).toEqual([{ userId: 'u1', email: 'Ada@Example.COM', url: expect.any(String), expiresAt }]);
     const url = new URL(mailer.sent[0].url);
     expect(url.searchParams.get('lang')).toBe('pl');
     expect(url.searchParams.get('token')).toMatch(/^[\w-]{43}$/);
+  });
+
+  it('asks markVerified() about the address as stored, so a case-sensitive comparison matches', async () => {
+    const { service, mailer } = verificationWith();
+    await service.send({ id: 'u1', email: 'Ada@Example.com' });
+
+    await expect(service.verify(tokenOf(mailer.sent[0].url))).resolves.toEqual({ userId: 'u1', email: 'Ada@Example.com' });
+    expect(mailer.marked).toEqual([['u1', 'Ada@Example.com']]);
+    await expect(service.send({ id: 'u2', email: ' ' })).rejects.toThrow(/the user needs an `email`/);
   });
 
   it('stores only the hash of the token', async () => {
@@ -180,7 +190,7 @@ class Accounts extends PasswordResetHandler {
     this.lookups.push(email);
     await this.lookup;
     const row = [...this.rows.values()].find((r) => r.email === email);
-    return row ? { id: row.id, passwordHash: row.passwordHash } : null;
+    return row ? { id: row.id, email: row.email, passwordHash: row.passwordHash } : null;
   }
   send(link: PasswordResetLink) {
     this.sent.push(link);
@@ -290,15 +300,18 @@ describe('PasswordResetService', () => {
     expect(late.accounts.rows.get('u1')!.passwordHash).toBe('h');
   });
 
-  it('refuses malformed tokens and passwords that are not strings, before any lookup', async () => {
+  it('refuses malformed tokens, and passwords the hasher would refuse, before any lookup', async () => {
     const { service, accounts, linkFor } = resetWith();
     accounts.rows.set('u1', { id: 'u1', email: 'ada@example.com', passwordHash: 'h' });
     const token = await linkFor('ada@example.com');
     accounts.lookups.length = 0;
 
     await expect(service.reset(token, 12345678 as never)).resolves.toBeNull();
+    await expect(service.reset(token, '')).resolves.toBeNull(); // an empty form field sets no password
+    await expect(service.reset(token, 'x'.repeat(4097))).resolves.toBeNull(); // over 4 KiB: no 500, no burnt link
     await expect(service.reset(`${token}x`, 'new password')).resolves.toBeNull();
     expect(accounts.lookups).toEqual([]);
+    expect(accounts.rows.get('u1')!.passwordHash).toBe('h');
 
     // The refusals did not burn the link.
     await expect(service.reset(token, 'new password')).resolves.toEqual({ userId: 'u1' });
@@ -346,6 +359,106 @@ describe('PasswordResetService', () => {
       'sign-in',
     ]);
     expect(seen.at(-1)).toMatchObject({ type: 'sign-in', userId: 'u1', method: 'password-reset' });
+  });
+
+  it('mails the link to the address the account has stored, never to the one typed', async () => {
+    const { service, accounts, settle } = resetWith();
+    accounts.rows.set('victim', { id: 'victim', email: 'victim@example.com', passwordHash: 'h' });
+    // A lookup that ignores accents, as MySQL's default collation does: `exämple.com` finds `example.com`.
+    const folded = (email: string) => email.normalize('NFD').replace(/\p{M}/gu, '');
+    accounts.findUser = async (email: string) => {
+      const row = [...accounts.rows.values()].find((r) => folded(r.email) === folded(email));
+      return row ? { id: row.id, email: row.email, passwordHash: row.passwordHash } : null;
+    };
+
+    service.request('victim@exämple.com'); // the attacker's look-alike domain
+    await settle();
+    expect(accounts.sent).toEqual([expect.objectContaining({ userId: 'victim', email: 'victim@example.com' })]);
+  });
+
+  it('refuses a link once the account’s stored address changed, even to one the lookup still finds', async () => {
+    const { service, accounts, linkFor } = resetWith();
+    accounts.rows.set('u1', { id: 'u1', email: 'ada@example.com', passwordHash: 'h' });
+    const token = await linkFor('ada@example.com');
+
+    accounts.rows.get('u1')!.email = 'Ada@Example.com';
+    // A case-insensitive lookup still finds the account: only its stored address tells.
+    accounts.findUser = async (email: string) => {
+      const row = [...accounts.rows.values()].find((r) => r.email.toLowerCase() === email);
+      return row ? { id: row.id, email: row.email, passwordHash: row.passwordHash } : null;
+    };
+    await expect(service.reset(token, 'new password')).resolves.toBeNull();
+    expect(accounts.rows.get('u1')!.passwordHash).toBe('h');
+  });
+
+  it('needs the stored address and password hash from findUser(): a query that leaves one out is an error', async () => {
+    const { service, accounts, linkFor, settle } = resetWith();
+    const logged = vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    try {
+      accounts.rows.set('u1', { id: 'u1', email: 'ada@example.com', passwordHash: 'h' });
+      const token = await linkFor('ada@example.com');
+      const complete = accounts.findUser.bind(accounts);
+
+      // Without `email`, nothing is sent: there is no address that is surely the account's.
+      accounts.findUser = async (email: string) => ({ ...(await complete(email))!, email: undefined as never });
+      service.request('ada@example.com');
+      await settle();
+      expect(accounts.sent).toHaveLength(1); // only the first link
+      expect(logged).toHaveBeenCalledWith('A password reset request failed', expect.stringContaining('must return the account’s stored `email`'));
+
+      // Without `passwordHash` (a column the query left out), a link would outlive a password change.
+      accounts.findUser = async (email: string) => ({ ...(await complete(email))!, passwordHash: undefined as never });
+      await expect(service.reset(token, 'new password')).rejects.toThrow(/must return `passwordHash`/);
+      expect(accounts.rows.get('u1')!.passwordHash).toBe('h');
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it('looks the account up only after request() returned, even with a handler that works synchronously', async () => {
+    const { service, accounts, settle } = resetWith();
+    accounts.findUser = (email: string) => {
+      accounts.lookups.push(email);
+      return null as never;
+    };
+
+    service.request('ada@example.com');
+    await Promise.resolve(); // what an async handler around the call would still see before it answers
+    expect(accounts.lookups).toEqual([]);
+    await settle();
+    expect(accounts.lookups).toEqual(['ada@example.com']);
+  });
+
+  it('looks up no address that no mail should go to', async () => {
+    const { service, accounts, settle } = resetWith();
+    for (const email of ['ada@example.com\r\nBcc: everyone@example.com', 'no-at-sign', `${'a'.repeat(243)}@example.com`]) {
+      service.request(email);
+    }
+    await settle();
+    expect(accounts.lookups).toEqual([]);
+  });
+
+  it('revokes sign-ins before the new password is stored, and again after it', async () => {
+    const { service, accounts, sessions, linkFor } = resetWith();
+    accounts.rows.set('u1', { id: 'u1', email: 'ada@example.com', passwordHash: 'h' });
+    const before = await sessions.create('u1');
+
+    // A store that fails the write: the old password stays, and so does no session made with it.
+    const store = accounts.updatePassword.bind(accounts);
+    accounts.updatePassword = () => {
+      throw new Error('database down');
+    };
+    await expect(service.reset(await linkFor('ada@example.com'), 'new password')).rejects.toThrow('database down');
+    await expect(sessions.validate(before.token)).resolves.toBeNull();
+
+    // A sign-in with the old password that lands while the new one is written is revoked too.
+    let during: { token: string } | undefined;
+    accounts.updatePassword = async (userId: string, hash: string) => {
+      during = await sessions.create(userId);
+      store(userId, hash);
+    };
+    await expect(service.reset(await linkFor('ada@example.com'), 'new password')).resolves.toEqual({ userId: 'u1' });
+    await expect(sessions.validate(during!.token)).resolves.toBeNull();
   });
 
   it('says how to enable the feature when it is off: request() throws at once, not in the background', async () => {

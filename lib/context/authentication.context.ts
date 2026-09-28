@@ -7,7 +7,12 @@ import { AuthenticationScope } from './authentication-scope.service.js';
  * The current user and session, readable from any singleton provider
  * without passing the request down. Correct in the handler and in
  * everything it calls or awaits, however many requests run at once. Empty
- * in middleware, guards and exception filters, and outside requests.
+ * in middleware, guards and exception filters, in interceptors that run
+ * before the module's own (an app's `APP_INTERCEPTOR` declared ahead of it:
+ * read `@CurrentUser()` or `request.user` there), and outside requests.
+ * A stream a handler returns but did not create (a shared `Subject`) runs
+ * its operators in the scope of whoever emits: read the user before
+ * building it.
  */
 @Injectable()
 export class AuthenticationContext<TUser = AuthenticatedUser, TSession = AuthenticatedSession> {

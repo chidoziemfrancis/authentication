@@ -11,6 +11,7 @@ import type { AuthenticationResult } from '../interfaces/authentication-result.i
 import { API_KEY_PATTERN, API_KEY_PREFIX_PATTERN } from '../utils/api-key.util.js';
 import { bearerToken } from '../utils/bearer.util.js';
 import { randomToken, safeEqual, sha256 } from '../utils/crypto.util.js';
+import { hasExpired } from '../utils/duration.util.js';
 import { AuthenticationProvider } from './authentication.provider.js';
 
 /** Compared against when the id is unknown, so every key costs the same hashing. */
@@ -104,7 +105,7 @@ export abstract class ApiKeyProvider<TUser> extends AuthenticationProvider<TUser
     }
 
     const expiresAt = record.expiresAt ?? undefined;
-    if (expiresAt && expiresAt.getTime() <= this.now()) {
+    if (expiresAt && hasExpired(expiresAt, this.now())) {
       this.reject('api key expired');
     }
 

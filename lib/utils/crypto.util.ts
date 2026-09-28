@@ -24,14 +24,17 @@ export function safeEqual(a: string, b: string): boolean {
   return left.length === right.length && timingSafeEqual(left, right);
 }
 
+/** The longest return path kept: a login or a link stores it until used, and anyone can start one. */
+const MAX_REDIRECT_LENGTH = 2_048;
+
 /**
  * Accepts only same-origin relative paths (`/x`, not `//evil`, `/\evil`,
  * or absolute URLs), to prevent open redirects, written only with the
  * printable ASCII a `Location` header carries (anything else
- * percent-encoded, as browsers send it).
+ * percent-encoded, as browsers send it), and at most 2,048 characters.
  */
 export function safeRedirectPath(value: unknown): string | undefined {
-  if (typeof value !== 'string' || !value.startsWith('/')) {
+  if (typeof value !== 'string' || !value.startsWith('/') || value.length > MAX_REDIRECT_LENGTH) {
     return undefined;
   }
   if (value.startsWith('//') || value.includes('\\') || !/^[\x21-\x7e]+$/.test(value)) {

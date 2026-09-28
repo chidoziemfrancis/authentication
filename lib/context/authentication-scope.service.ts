@@ -16,6 +16,26 @@ export interface HttpExchange {
 }
 
 /**
+ * The call the interceptor is handling, for the param decorators, which have no instance to ask:
+ * one store for the process, entered with the instance's own by `AuthenticationScopeInterceptor`.
+ */
+const calls = new AsyncLocalStorage<Scope>();
+
+/** @internal Runs `fn` as the handling of this call (the interceptor, around `next.handle()`). */
+export function runCall<R>(scope: Scope, fn: () => R): R {
+  return calls.run(scope, fn);
+}
+
+/**
+ * @internal What the handler of this call sees: the result the guard recorded for it, when the
+ * interceptor is handling this handler (param decorators are resolved inside it).
+ */
+export function scopedResult(context: ExecutionContext): Scope['result'] | undefined {
+  const call = calls.getStore();
+  return call?.context && call.context.getHandler() === context.getHandler() ? call.result : undefined;
+}
+
+/**
  * @internal The per-call scope behind `AuthenticationContext` and
  * `SignInService`: its own `AsyncLocalStorage`, opened around each handler
  * by `AuthenticationScopeInterceptor`.

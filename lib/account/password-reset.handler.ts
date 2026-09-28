@@ -8,7 +8,11 @@ import type { PasswordResetAccount, PasswordResetLink } from '../interfaces/pass
  * `registry.registerHandler('passwordReset', this)`.
  */
 export abstract class PasswordResetHandler {
-  /** The account whose address this is, or `null`. Called with the address trimmed and lowercased. */
+  /**
+   * The account whose address this is, with the address and the password
+   * hash it has stored, or `null`. Called with the address trimmed,
+   * lowercased and in Unicode NFC.
+   */
   abstract findUser(email: string): PasswordResetAccount | null | Promise<PasswordResetAccount | null>;
   abstract send(link: PasswordResetLink): void | Promise<void>;
   /** Stores the new password's hash (from `PasswordHasher`). */

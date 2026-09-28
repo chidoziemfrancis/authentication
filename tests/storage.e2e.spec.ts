@@ -394,6 +394,15 @@ describe('the production guard', () => {
     );
   });
 
+  it('takes NODE_ENV as production whatever its case, and with stray spaces (a .env file)', async () => {
+    for (const spelling of ['Production', 'PRODUCTION', 'production ', ' production\n']) {
+      process.env.NODE_ENV = spelling;
+      await expect(start([AuthenticationModule.forRoot({ accessToken: { key: KEY } })], [Bearer])).rejects.toThrow(
+        'no store is registered for `refreshTokens` (RefreshTokenStore) and `mfa` (MfaStore)',
+      );
+    }
+  });
+
   it('stays out of the way outside production', async () => {
     process.env.NODE_ENV = 'development';
     const dev = await start([AuthenticationModule.forRoot({ accessToken: { key: KEY } })], [Sessions]);

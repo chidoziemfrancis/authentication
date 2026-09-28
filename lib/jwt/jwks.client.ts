@@ -12,6 +12,8 @@ interface CachedKey {
   key: KeyObject;
 }
 
+const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]']);
+
 function algorithmsFor(jwk: JsonWebKey): JwsAlgorithm[] {
   if (jwk.kty === 'RSA') {
     return ['RS256'];
@@ -55,6 +57,17 @@ export class JwksClient {
     readonly uri: string,
     options: JwksClientOptions = {},
   ) {
+    let url: URL | undefined;
+    try {
+      url = new URL(uri);
+    } catch {
+      url = undefined;
+    }
+    // Whoever serves the key set decides which tokens verify: never over plain http, but on loopback.
+    if (!url || (url.protocol !== 'https:' && !(url.protocol === 'http:' && LOOPBACK.has(url.hostname)))) {
+      throw new TypeError(`JwksClient: the key set must be an https URL (http only on loopback), got ${JSON.stringify(uri)}.`);
+    }
+
     this.options = {
       ...options,
       cacheTtl: durationOr(options.cacheTtl, '10m'),
@@ -123,23 +136,31 @@ export class JwksClient {
         throw new Error('it has no keys array');
       }
 
-      this.keys = body.keys.flatMap((jwk: JsonWebKey & { kid?: string; alg?: string; use?: string; key_ops?: string[] }) => {
-        if (jwk.use !== undefined && jwk.use !== 'sig') {
-          return [];
-        }
-        if (jwk.key_ops !== undefined && !jwk.key_ops.includes('verify')) {
-          return [];
-        }
-        const algorithms = algorithmsFor(jwk);
-        if (algorithms.length === 0) {
-          return [];
-        }
-
+      // Each entry on its own: one the client cannot read (null, `key_ops` that is no list) is skipped,
+      // and the set's other keys still load.
+      this.keys = body.keys.flatMap((entry: unknown) => {
         try {
+          if (typeof entry !== 'object' || entry === null) {
+            return [];
+          }
+          const jwk = entry as JsonWebKey & { kid?: unknown; alg?: unknown; use?: unknown; key_ops?: unknown };
+          if (jwk.use !== undefined && jwk.use !== 'sig') {
+            return [];
+          }
+          if (jwk.key_ops !== undefined && !(Array.isArray(jwk.key_ops) && jwk.key_ops.includes('verify'))) {
+            return [];
+          }
+          const algorithms = algorithmsFor(jwk);
+          if (algorithms.length === 0) {
+            return [];
+          }
+
           // Only the public members are read; a JWKS that leaks `d` still yields a public key.
           const { d: _d, p: _p, q: _q, dp: _dp, dq: _dq, qi: _qi, ...publicJwk } = jwk;
-          const key = createPublicKey({ key: publicJwk, format: 'jwk' });
-          return [{ kid: jwk.kid, alg: jwk.alg, algorithms, key }];
+          const key = createPublicKey({ key: publicJwk as JsonWebKey, format: 'jwk' });
+          const kid = typeof jwk.kid === 'string' ? jwk.kid : undefined;
+          const alg = typeof jwk.alg === 'string' ? jwk.alg : undefined;
+          return [{ kid, alg, algorithms, key }];
         } catch {
           return [];
         }

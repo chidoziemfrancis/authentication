@@ -106,11 +106,11 @@ describe('SessionService', () => {
     expect((await sessions.create('u1')).session).not.toHaveProperty('metadata');
 
     const first = await sessions.create('u1', { metadata: { device: 'laptop' } });
-    const rotated = await sessions.rotate(first.session);
+    const rotated = (await sessions.rotate(first.session))!;
     expect(rotated.session.metadata).toEqual({ device: 'laptop' });
     expect(rotated.session.id).not.toBe(first.session.id);
 
-    const renamed = await sessions.rotate(rotated.session, { metadata: { device: 'work laptop' } });
+    const renamed = (await sessions.rotate(rotated.session, { metadata: { device: 'work laptop' } }))!;
     expect(renamed.session.metadata).toEqual({ device: 'work laptop' });
   });
 
@@ -120,7 +120,7 @@ describe('SessionService', () => {
     expect(issued.cookie).toMatch(/^sid=[\w-]{43}; Max-Age=3600; Path=\/; HttpOnly; SameSite=Lax$/);
 
     tick(600_000);
-    expect((await sessions.rotate(issued.session)).cookie).toContain('Max-Age=3000;');
+    expect((await sessions.rotate(issued.session))!.cookie).toContain('Max-Age=3000;');
   });
 
   it('clearCookie() expires the cookie with the attributes it was set with', () => {
@@ -265,6 +265,16 @@ describe('SignInService', () => {
     expect(live.result).toBe(true);
     expect(live.cookies).toEqual([expect.stringMatching(/^sid=; Max-Age=0; /)]);
     expect(seen).toEqual([{ type: 'sign-out', userId: 'u1', sessionId: issued.session.id }]);
+  });
+
+  it('signOut() deletes the session even where it looks idle: another instance may still take it', async () => {
+    const { signIn, inRequest, cookieHeader, store, tick } = setup({ idleTtl: '1m', touchInterval: '10s' });
+    const { result: issued } = await inRequest({}, () => signIn.signIn('u1'));
+    tick(61_000); // idle here; an instance with a lagging clock, or a longer idleTtl, still accepts it
+
+    const signedOut = await inRequest(cookieHeader(issued.cookie), () => signIn.signOut());
+    expect(signedOut.result).toBe(false);
+    await expect(store.getSession(issued.session.id)).resolves.toBeUndefined();
   });
 
   it('rotateSession() gives the browser a new cookie for the same user, and null without a session', async () => {

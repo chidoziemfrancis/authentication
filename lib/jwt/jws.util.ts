@@ -1,5 +1,6 @@
 import {
   KeyObject,
+  X509Certificate,
   createHmac,
   createPrivateKey,
   createPublicKey,
@@ -23,13 +24,16 @@ export interface JwsHeader {
 }
 
 const SEGMENT = /^[A-Za-z0-9_-]+$/;
-const PEM = /-----BEGIN ([A-Z0-9 ]+)-----/;
+const PEM = /-----BEGIN ([A-Z0-9 ]+)-----/g;
 
 /**
  * A key from configuration. PEM text (a string or a `Buffer`: SPKI, PKCS#1,
  * PKCS#8, SEC1, or an X.509 certificate) is read as the key it encodes;
  * only other text is an HMAC secret. Read as a secret, a PEM public key
- * would let anyone who has it, which is everyone, sign HS256 tokens.
+ * would let anyone who has it, which is everyone, sign HS256 tokens. So
+ * would a JWK, or a key in DER (bytes, or base64 of them), which are refused:
+ * import it with `createPublicKey({ key, format: 'jwk' })` (or `'der'`, or
+ * `createPrivateKey`) and pass the `KeyObject`.
  */
 export function toKeyObject(key: KeyObject | string | Buffer): KeyObject {
   if (key instanceof KeyObject) {
@@ -37,15 +41,30 @@ export function toKeyObject(key: KeyObject | string | Buffer): KeyObject {
   }
 
   const text = typeof key === 'string' ? key : key.toString('latin1');
-  const pem = PEM.exec(text);
-  if (!pem) {
+  // Every block's label: `openssl ecparam -genkey` puts EC PARAMETERS before the private key, and
+  // a bundle may put a certificate first.
+  const labels = [...text.matchAll(PEM)].map((match) => match[1]);
+  if (labels.length === 0) {
+    if (isJwk(text)) {
+      throw new TypeError(
+        'The key is a JWK, which would be read as an HS256 secret. Import it and pass the KeyObject: ' +
+          "`createPublicKey({ key: JSON.parse(jwk), format: 'jwk' })`, or `createPrivateKey` for a private key.",
+      );
+    }
+    if (isEncodedKey(key)) {
+      throw new TypeError(
+        'The key is DER (binary, or base64 of it, as Keycloak shows `public_key`), which would be read as an ' +
+          "HS256 secret. Pass PEM text, or the KeyObject: `createPublicKey({ key, format: 'der', type: 'spki' })`.",
+      );
+    }
     return createSecretKey(typeof key === 'string' ? Buffer.from(key) : key);
   }
 
+  const label = labels.find((name) => name.includes('PRIVATE KEY')) ?? labels[0];
   try {
-    return pem[1].includes('PRIVATE KEY') ? createPrivateKey(key) : createPublicKey(key);
+    return label.includes('PRIVATE KEY') ? createPrivateKey(key) : createPublicKey(key);
   } catch (error) {
-    throw new TypeError(`Cannot read the PEM ${pem[1].toLowerCase()}: ${(error as Error).message}`);
+    throw new TypeError(`Cannot read the PEM ${label.toLowerCase()}: ${(error as Error).message}`);
   }
 }
 
@@ -152,11 +171,18 @@ export function decodeJws(token: string): DecodedJws {
     throw new JwtError('malformed token');
   }
 
+  // One signature, one spelling: the unused low bits of the last character would otherwise give
+  // several token strings for one token, and a list or a cache keyed by the string would miss them.
+  const signature = Buffer.from(parts[2], 'base64url');
+  if (signature.toString('base64url') !== parts[2]) {
+    throw new JwtError('malformed token');
+  }
+
   return {
     header,
     payload: decodeJson(parts[1]) as JwtClaims,
     signingInput: Buffer.from(`${parts[0]}.${parts[1]}`),
-    signature: Buffer.from(parts[2], 'base64url'),
+    signature,
   };
 }
 
@@ -248,6 +274,54 @@ export function validateClaims(claims: JwtClaims, rules: ClaimRules): void {
     if (!given.some((aud) => typeof aud === 'string' && accepted.includes(aud))) {
       throw new JwtError('unexpected audience');
     }
+  }
+}
+
+/**
+ * Whether the bytes are a key or a certificate in DER, given as bytes or as
+ * base64 text: never a secret (random bytes do not parse as DER), and what a
+ * key management service's `GetPublicKey` or Keycloak's `public_key` gives.
+ */
+function isEncodedKey(key: string | Buffer): boolean {
+  const candidates: Buffer[] = [];
+  if (Buffer.isBuffer(key)) {
+    candidates.push(key);
+  }
+  const compact = (typeof key === 'string' ? key : key.toString('latin1')).replace(/\s+/g, '');
+  if (/^[A-Za-z0-9+/_-]{40,}={0,2}$/.test(compact)) {
+    candidates.push(Buffer.from(compact, 'base64'));
+  }
+
+  const readers: ((der: Buffer) => unknown)[] = [
+    (der) => createPublicKey({ key: der, format: 'der', type: 'spki' }),
+    (der) => createPublicKey({ key: der, format: 'der', type: 'pkcs1' }),
+    (der) => createPrivateKey({ key: der, format: 'der', type: 'pkcs8' }),
+    (der) => createPrivateKey({ key: der, format: 'der', type: 'pkcs1' }),
+    (der) => createPrivateKey({ key: der, format: 'der', type: 'sec1' }),
+    (der) => new X509Certificate(der),
+  ];
+  return candidates.some((der) =>
+    readers.some((read) => {
+      try {
+        read(der);
+        return true;
+      } catch {
+        return false;
+      }
+    }),
+  );
+}
+
+/** A JSON Web Key (a JSON object with `kty`), as a JWKS or an environment variable holds one. */
+function isJwk(text: string): boolean {
+  if (!text.trimStart().startsWith('{')) {
+    return false;
+  }
+  try {
+    const value: unknown = JSON.parse(text);
+    return typeof value === 'object' && value !== null && typeof (value as { kty?: unknown }).kty === 'string';
+  } catch {
+    return false;
   }
 }
 

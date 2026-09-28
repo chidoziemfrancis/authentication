@@ -126,6 +126,79 @@ describe('AuthenticationGuard over HTTP', () => {
     expect([first.calls, second.calls]).toEqual([1, 0]);
   });
 
+  it('leaves a `request.session` another package owns (express-session) alone, and still mirrors the user', async () => {
+    const { guard } = setup();
+    const owned = { cookie: {}, csrfSecret: 's', regenerate() {}, save() {} };
+    const { context, request } = http('required', { 'x-first': 'ok' }, { headers: { 'x-first': 'ok' }, session: owned });
+
+    await expect(guard.canActivate(context)).resolves.toBe(true);
+    expect(request.user).toEqual({ id: 'first' });
+    expect(request.session).toBe(owned);
+
+    // Anonymous on an optional route: still not nulled.
+    const optional = http('optional', {}, { headers: {}, session: owned });
+    await guard.canActivate(optional.context);
+    expect(optional.request.session).toBe(owned);
+  });
+
+  it('counts a falsy user (0, an empty string, false) as none, and asks the next provider', async () => {
+    const { second } = setup();
+    const falsy = new (class extends HeaderProvider {
+      authenticate(context: ExecutionContext) {
+        this.calls++;
+        const value = { zero: 0, empty: '', false: false }[this.header(context, 'x-falsy') as 'zero'];
+        return { user: value as never };
+      }
+    })('falsy');
+    const registry = new AuthenticationRegistry();
+    registry.registerProvider(falsy, { order: 1 });
+    registry.registerProvider(second, { order: 2 });
+    registry[LOCK_REGISTRY]({ log: false });
+    const chained = new AuthenticationGuard(new Reflector(), new HttpAdapterHost(), registry);
+
+    for (const kind of ['zero', 'empty', 'false']) {
+      const { context, request } = http('required', { 'x-falsy': kind, 'x-second': 'ok' });
+      await expect(chained.canActivate(context)).resolves.toBe(true);
+      expect(request.user).toEqual({ id: 'second' });
+    }
+  });
+
+  it('with `providers: []`, refuses every caller, a cached result of another provider included', async () => {
+    const { guard } = setup();
+    class Closed {
+      @Authenticate({ providers: [] })
+      handle() {}
+    }
+    const request: Request = { headers: { 'x-first': 'ok' } };
+    await guard.canActivate(http('required', {}, request).context); // caches `first`'s user on the request
+
+    const context = new ExecutionContextHost([request, {}], Closed, Closed.prototype.handle);
+    context.setType('http');
+    await expect(refusal(guard.canActivate(context))).resolves.toBeInstanceOf(UnauthorizedException);
+  });
+
+  it('caches per GraphQL operation, not per `req`: over graphql-ws every operation of a socket shares one', async () => {
+    const { guard, first } = setup();
+    const upgrade: Request = { headers: { 'x-first': 'ok' } }; // the upgrade request, shared by the socket's operations
+    const operation = () => {
+      const context = new ExecutionContextHost([{}, {}, { req: upgrade }, {}], Routes, Routes.prototype.required);
+      context.setType('graphql');
+      return context;
+    };
+
+    await expect(guard.canActivate(operation())).resolves.toBe(true);
+    upgrade.headers['x-first'] = 'bad'; // the session was revoked meanwhile
+    await expect(refusal(guard.canActivate(operation()))).resolves.toMatchObject({ message: 'bad first' });
+    expect(first.calls).toBe(2);
+
+    // Root and field resolvers of one operation share its context: one run.
+    const shared = operation();
+    upgrade.headers['x-first'] = 'ok';
+    await guard.canActivate(shared);
+    await guard.canActivate(shared);
+    expect(first.calls).toBe(3);
+  });
+
   it('skips a result without a user', async () => {
     const { guard, second } = setup();
     const { context, request } = http('required', { 'x-first': 'no-user', 'x-second': 'ok' });

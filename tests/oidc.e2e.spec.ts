@@ -8,6 +8,7 @@ import {
   AuthenticationRegistry,
   CurrentUser,
   InMemoryOidcStateStore,
+  JwtSigner,
   MfaService,
   OidcAccountResolver,
   OidcService,
@@ -22,6 +23,9 @@ import {
   type OidcProfile,
   type OidcResolveContext,
 } from '../lib/index.js';
+import { OidcError } from '../lib/errors/oidc.error.js';
+import { sha256 } from '../lib/utils/crypto.util.js';
+import { OidcClient } from '../lib/oidc/oidc.client.js';
 import { SessionAuthModule, UsersModule, UsersRepository, registryWith, storageWith, type User } from './fixtures.js';
 import { MockOidcProvider } from './mock-oidc.js';
 
@@ -183,7 +187,11 @@ describe.each(adapters.map((a) => a.name))('OIDC sign-in (%s)', (adapter) => {
     });
     expect(params.get('code_challenge')).toMatch(/^[\w-]{43}$/);
     expect(params.get('nonce')).toMatch(/^[\w-]{43}$/);
-    expect(tx).toBe(`oidc_tx=${params.get('state')}`);
+    // The cookie holds the secret whose SHA-256 is the state: never the state, which URLs carry.
+    const binding = tx.slice('oidc_tx='.length);
+    expect(binding).toMatch(/^[\w-]{43}$/);
+    expect(binding).not.toBe(params.get('state'));
+    expect(sha256(binding)).toBe(params.get('state'));
   });
 
   it('completes the flow: session cookie, tx cookie cleared, safe redirect', async () => {
@@ -239,6 +247,22 @@ describe.each(adapters.map((a) => a.name))('OIDC sign-in (%s)', (adapter) => {
       const code = idp.approve(location, { sub: 'alice-sub' });
       await callback('mock', { code, state: params.get('state')! }, tx).expect(302);
       await callback('mock', { code, state: params.get('state')! }, tx).expect(400);
+    });
+
+    it('refuses a callback URL replayed from another client with the state as its cookie (a leaked URL)', async () => {
+      // The victim's callback failed (a second tab replaced the cookie), and its URL sits in a log.
+      const victim = await begin();
+      await begin(); // the second tab
+      const code = idp.approve(victim.location, { sub: 'alice-sub' });
+      const state = victim.params.get('state')!;
+
+      // Whoever reads the URL knows the state, never the secret the cookie holds.
+      const forged = await callback('mock', { code, state }, `oidc_tx=${state}`).expect(400);
+      expect(forged.body.message).toBe('state mismatch');
+      expect(cookie(forged, 'sid')).toBeUndefined();
+
+      // The login is still the victim's to finish.
+      await callback('mock', { code, state }, victim.tx).expect(302);
     });
 
     it('rejects a transaction started for another provider', async () => {
@@ -381,6 +405,23 @@ describe.each(adapters.map((a) => a.name))('OIDC sign-in (%s)', (adapter) => {
       await http().get('/me').set('Cookie', await signInAs('alice-second-account')).expect(200, { id: 'u1' });
     });
 
+    it('refuses to start from another site’s page, which would link whatever account the IdP has signed in', async () => {
+      const sid = await signInAs('alice-sub');
+      const crossSite = await http()
+        .get('/auth/oidc/mock/login')
+        .query({ link: 'true' })
+        .set('Cookie', sid)
+        .set('Sec-Fetch-Site', 'cross-site')
+        .expect(403);
+      expect(crossSite.body.message).toBe('Cross-site link refused');
+      expect(cookie(crossSite, 'oidc_tx')).toBeUndefined();
+
+      // From the app's own pages, or typed in: allowed.
+      for (const site of ['same-origin', 'same-site', 'none']) {
+        await http().get('/auth/oidc/mock/login').query({ link: 'true' }).set('Cookie', sid).set('Sec-Fetch-Site', site).expect(302);
+      }
+    });
+
     it('needs a signed-in session to start', async () => {
       await http().get('/auth/oidc/mock/login').query({ link: 'true' }).expect(401);
       await http().get('/auth/oidc/mock/login').query({ link: 'true' }).set('Cookie', `sid=${'x'.repeat(43)}`).expect(401);
@@ -473,7 +514,8 @@ describe.each(adapters.map((a) => a.name))('OIDC routes at another path, forRoot
 });
 
 describe('OidcService', () => {
-  const state = 'S'.repeat(43);
+  const binding = 'S'.repeat(43);
+  const state = sha256(binding);
   function setup(oidc: Partial<OidcOptions> = {}) {
     const store = new InMemoryOidcStateStore();
     const storage = storageWith({ oidcStates: store });
@@ -498,6 +540,19 @@ describe('OidcService', () => {
     expect(cookies).toEqual([expect.stringMatching(/^__Host-oidc_tx=[\w-]{43}; Max-Age=600; Path=\/; HttpOnly; Secure; SameSite=Lax$/)]);
   });
 
+  it('returns the session cookie with the transaction cookie, for callers outside HTTP', async () => {
+    const { service } = setup();
+    const login = await service.start('mock', { request: { method: 'GET', headers: {} } });
+    const code = idp.approve(login.url, { sub: 'alice-sub' });
+    const request = { method: 'GET', headers: { cookie: login.cookies[0].split(';')[0] } };
+
+    const finished = await service.finish('mock', { state: new URL(login.url).searchParams.get('state'), code }, { request });
+    expect(finished.cookies).toEqual([
+      expect.stringMatching(/^__Host-sid=[\w-]{43}; Max-Age=\d+; Path=\/; HttpOnly; Secure; SameSite=Lax$/),
+      expect.stringMatching(/^__Host-oidc_tx=; Max-Age=0; /),
+    ]);
+  });
+
   it('expires logins by the configured clock', async () => {
     let clock = Date.now();
     const { store, service } = setup({ now: () => clock });
@@ -505,7 +560,7 @@ describe('OidcService', () => {
 
     clock += 2_000;
 
-    const request = { method: 'GET', headers: { cookie: `__Host-oidc_tx=${state}` } };
+    const request = { method: 'GET', headers: { cookie: `__Host-oidc_tx=${binding}` } };
     await expect(service.finish('mock', { state, code: 'c' }, { request })).rejects.toThrow('unknown or expired login');
   });
 
@@ -541,12 +596,235 @@ describe('OidcService', () => {
   });
 });
 
-describe('presets', () => {
-  it('refuses multi-tenant Microsoft endpoints', () => {
-    expect(() => microsoft({ tenant: 'common', clientId: 'a', clientSecret: 'b' })).toThrow(/multi-tenant/);
-    expect(microsoft({ tenant: 'contoso.onmicrosoft.com', clientId: 'a', clientSecret: 'b' }).issuer).toBe(
-      'https://login.microsoftonline.com/contoso.onmicrosoft.com/v2.0',
+describe('OidcClient: what it refuses from a provider', () => {
+  const ISSUER = 'https://idp.example.com';
+  const REDIRECT = 'https://app.test/auth/oidc/idp/callback';
+  const rsa = generateKeyPairSync('rsa', { modulusLength: 2048 });
+
+  interface Behaviour {
+    /** Merged into the discovery document. */
+    document?: Record<string, unknown>;
+    /** Merged into the token response (`undefined` drops a member). */
+    token?: Record<string, unknown>;
+    /** Merged into the ID token's claims. */
+    claims?: Record<string, unknown>;
+    /** Merged into the userinfo response. */
+    userinfo?: Record<string, unknown>;
+    /** Paths that answer with this status, or fail as a network error would. */
+    fail?: Record<string, number | 'network'>;
+  }
+
+  /** A provider behind a stub `fetch`, and the client that talks to it. */
+  function provider({ document = {}, token = {}, claims = {}, userinfo = {}, fail = {} }: Behaviour = {}) {
+    let nonce = '';
+    const fetch = (async (input: string | URL) => {
+      const { pathname } = new URL(String(input));
+      const failure = fail[pathname];
+      if (failure === 'network') {
+        throw new TypeError('fetch failed');
+      }
+      if (failure !== undefined) {
+        return Response.json({}, { status: failure });
+      }
+
+      switch (pathname) {
+        case '/.well-known/openid-configuration':
+          return Response.json({
+            issuer: ISSUER,
+            authorization_endpoint: `${ISSUER}/authorize`,
+            token_endpoint: `${ISSUER}/token`,
+            jwks_uri: `${ISSUER}/jwks`,
+            ...document,
+          });
+        case '/jwks':
+          return Response.json({ keys: [{ ...rsa.publicKey.export({ format: 'jwk' }), kid: 'k1', use: 'sig' }] });
+        case '/token': {
+          const signer = new JwtSigner({ key: rsa.privateKey, kid: 'k1', issuer: ISSUER, audience: 'client', ttl: '5m' });
+          const idToken = signer.sign({ sub: 'alice', nonce, email: 'alice@example.com', ...claims });
+          return Response.json({ access_token: 'at', token_type: 'Bearer', id_token: idToken, ...token });
+        }
+        case '/userinfo':
+          return Response.json({ sub: 'alice', ...userinfo });
+        default:
+          return Response.json({}, { status: 404 });
+      }
+    }) as typeof globalThis.fetch;
+
+    const client = new OidcClient('idp', { issuer: ISSUER, clientId: 'client', clientSecret: 'secret' }, { fetch });
+    return {
+      client,
+      async callback(params: Record<string, unknown> = {}) {
+        const { transaction } = await client.authorizationRequest(REDIRECT);
+        nonce = transaction.nonce!;
+        return client.callback({ code: 'the-code', state: transaction.state, ...params }, transaction, REDIRECT);
+      },
+    };
+  }
+
+  async function refusal(promise: Promise<unknown>): Promise<Pick<OidcError, 'kind' | 'message'>> {
+    const error = await promise.then(
+      () => undefined,
+      (caught: unknown) => caught,
     );
+    expect(error).toBeInstanceOf(OidcError);
+    const { kind, message } = error as OidcError;
+    return { kind, message };
+  }
+
+  it('signs in with a well-behaved provider (the baseline the cases below break)', async () => {
+    const { profile } = await provider().callback();
+    expect(profile).toMatchObject({ provider: 'idp', subject: 'alice', email: 'alice@example.com', emailVerified: false });
+  });
+
+  it('refuses a discovery document that names another issuer, or that it cannot load (OIDC Discovery §4.3)', async () => {
+    const other = provider({ document: { issuer: 'https://evil.example.com' } });
+    expect(await refusal(other.callback())).toEqual({ kind: 'unavailable', message: 'discovery issuer mismatch' });
+
+    const down = provider({ fail: { '/.well-known/openid-configuration': 503 } });
+    expect(await refusal(down.callback())).toEqual({ kind: 'unavailable', message: 'discovery failed (503)' });
+  });
+
+  it('refuses endpoints that are not https, except on loopback, as a misconfiguration (502), not a failed sign-in', async () => {
+    const http = provider({ document: { token_endpoint: 'http://idp.example.com/token' } });
+    expect(await refusal(http.callback())).toEqual({ kind: 'unavailable', message: 'token_endpoint must use https' });
+
+    const garbage = provider({ document: { authorization_endpoint: 'not a url' } });
+    expect(await refusal(garbage.callback())).toEqual({ kind: 'unavailable', message: 'authorization_endpoint is not a URL' });
+
+    const keys = provider({ document: { jwks_uri: 'http://idp.example.com/jwks' } });
+    expect(await refusal(keys.callback())).toEqual({ kind: 'unavailable', message: 'jwks_uri must use https' });
+  });
+
+  it('requires the `iss` response parameter from a provider that says it sends one (RFC 9207 mix-up defence)', async () => {
+    const strict = provider({ document: { authorization_response_iss_parameter_supported: true } });
+    expect(await refusal(strict.callback())).toEqual({ kind: 'request', message: 'missing iss' });
+    await expect(strict.callback({ iss: ISSUER })).resolves.toMatchObject({ profile: { subject: 'alice' } });
+  });
+
+  it('refuses a callback without a code', async () => {
+    expect(await refusal(provider().callback({ code: undefined }))).toEqual({ kind: 'request', message: 'missing code' });
+    expect(await refusal(provider().callback({ code: '' }))).toEqual({ kind: 'request', message: 'missing code' });
+  });
+
+  it('refuses token responses without an ID token, an access token or the Bearer type', async () => {
+    const cases: [Record<string, unknown>, string][] = [
+      [{ id_token: undefined }, 'missing id_token'],
+      [{ access_token: undefined }, 'malformed token response'],
+      [{ token_type: 'mac' }, 'malformed token response'],
+      [{ token_type: undefined }, 'malformed token response'],
+    ];
+    for (const [token, message] of cases) {
+      expect(await refusal(provider({ token }).callback())).toEqual({ kind: 'verification', message });
+    }
+  });
+
+  it('refuses an ID token with an empty subject, or issued to another party (`azp`)', async () => {
+    expect(await refusal(provider({ claims: { sub: '' } }).callback())).toEqual({
+      kind: 'verification',
+      message: 'id_token without subject',
+    });
+    expect(await refusal(provider({ claims: { azp: 'another-client' } }).callback())).toEqual({
+      kind: 'verification',
+      message: 'id_token azp mismatch',
+    });
+  });
+
+  it('takes an address as verified only on a boolean `true`, and the ID token’s claims over userinfo’s', async () => {
+    const document = { userinfo_endpoint: `${ISSUER}/userinfo` };
+    const quoted = provider({ document, userinfo: { email_verified: 'true' } });
+    expect((await quoted.callback()).profile.emailVerified).toBe(false);
+
+    const conflicting = provider({ document, claims: { email_verified: true }, userinfo: { email: 'mallory@example.com', email_verified: false } });
+    expect((await conflicting.callback()).profile).toMatchObject({ email: 'alice@example.com', emailVerified: true });
+  });
+
+  it('takes the address and its `email_verified` from one source, never one from each', async () => {
+    const document = { userinfo_endpoint: `${ISSUER}/userinfo` };
+    // The ID token names an address it does not vouch for; userinfo vouches for another one.
+    const split = provider({ document, claims: { email: 'ceo@victim.example' }, userinfo: { email: 'mallory@idp.example', email_verified: true } });
+    expect((await split.callback()).profile).toMatchObject({ email: 'ceo@victim.example', emailVerified: false });
+
+    // No address in the ID token: userinfo's, with its own flag.
+    const fromUserinfo = provider({ document, claims: { email: undefined }, userinfo: { email: 'bob@example.com', email_verified: true } });
+    expect((await fromUserinfo.callback()).profile).toMatchObject({ email: 'bob@example.com', emailVerified: true });
+
+    // A flag with no address verifies nothing.
+    const flagOnly = provider({ claims: { email: undefined, email_verified: true } });
+    expect((await flagOnly.callback()).profile).toMatchObject({ email: undefined, emailVerified: false });
+  });
+
+  it('names only the host and path of an API call that failed, never its query', async () => {
+    const fetch = (async (input: string | URL) =>
+      new URL(String(input)).pathname === '/token'
+        ? Response.json({ access_token: 'at', token_type: 'bearer' })
+        : Response.json({}, { status: 403 })) as typeof globalThis.fetch;
+    const client = new OidcClient(
+      'api',
+      {
+        kind: 'oauth2',
+        clientId: 'client',
+        clientSecret: 'secret',
+        authorizationEndpoint: `${ISSUER}/authorize`,
+        tokenEndpoint: `${ISSUER}/token`,
+        profile: (_, { fetchJson }) => fetchJson(`${ISSUER}/me?access_token=AT-123&appsecret_proof=deadbeef`),
+      },
+      { fetch },
+    );
+    const { transaction } = await client.authorizationRequest(REDIRECT);
+
+    const error = await refusal(client.callback({ code: 'c' }, transaction, REDIRECT));
+    expect(error).toEqual({ kind: 'verification', message: 'idp.example.com/me answered 403' });
+  });
+
+  it('answers an outage with `unavailable` (502), and a refusal with `verification` (401)', async () => {
+    const unreachable = provider({ fail: { '/token': 'network' } });
+    expect(await refusal(unreachable.callback())).toEqual({
+      kind: 'unavailable',
+      message: 'idp.example.com is unreachable (fetch failed)',
+    });
+
+    const refused = provider({ document: { userinfo_endpoint: `${ISSUER}/userinfo` }, fail: { '/userinfo': 401 } });
+    expect(await refusal(refused.callback())).toEqual({ kind: 'verification', message: 'userinfo endpoint answered 401' });
+
+    // Its key set down: an outage too, not a server error.
+    const keysDown = provider({ fail: { '/jwks': 503 } });
+    expect(await refusal(keysDown.callback())).toEqual({
+      kind: 'unavailable',
+      message: `JWKS ${ISSUER}/jwks is unavailable: it answered 503`,
+    });
+  });
+
+  it('checks its configuration when it is created', () => {
+    expect(() => new OidcClient('idp', { clientId: 'client' })).toThrow("OIDC provider 'idp' needs an issuer");
+    expect(() => new OidcClient('gh', { kind: 'oauth2', clientId: 'client', tokenEndpoint: 'https://gh.test/token' })).toThrow(
+      "OAuth 2.0 provider 'gh' needs authorizationEndpoint, tokenEndpoint and profile()",
+    );
+  });
+});
+
+describe('presets', () => {
+  it('takes a Microsoft tenant by its id: a domain, or a multi-tenant endpoint, publishes another issuer', () => {
+    // Discovery for `contoso.onmicrosoft.com` names `https://login.microsoftonline.com/<its GUID>/v2.0`.
+    for (const tenant of ['common', 'organizations', 'consumers', 'contoso.onmicrosoft.com', 'Common', '']) {
+      expect(() => microsoft({ tenant, clientId: 'a', clientSecret: 'b' })).toThrow(/^microsoft\(\): pass the tenant id, a GUID/);
+    }
+    expect(microsoft({ tenant: '72F988BF-86F1-41AF-91AB-2D7CD011DB47', clientId: 'a', clientSecret: 'b' }).issuer).toBe(
+      'https://login.microsoftonline.com/72f988bf-86f1-41af-91ab-2d7cd011db47/v2.0',
+    );
+  });
+
+  it('takes from GitHub only an address flagged primary and verified with booleans', async () => {
+    const preset = github({ clientId: 'a', clientSecret: 'b' });
+    const profileOf = (emails: unknown) =>
+      preset.profile!({ id: 7, login: 'octo' }, { provider: 'github', tokens: { accessToken: 't' }, fetchJson: async () => emails });
+
+    await expect(profileOf([{ email: 'x@example.com', primary: 'true', verified: 1 }])).resolves.toMatchObject({ email: undefined, emailVerified: false });
+    await expect(profileOf([{ email: 'x@example.com', primary: true, verified: false }])).resolves.toMatchObject({ emailVerified: false });
+    await expect(profileOf([null, { email: 'x@example.com', primary: true, verified: true }])).resolves.toMatchObject({
+      email: 'x@example.com',
+      emailVerified: true,
+    });
+    await expect(profileOf({ message: 'Bad credentials' })).resolves.toMatchObject({ emailVerified: false });
   });
 });
 

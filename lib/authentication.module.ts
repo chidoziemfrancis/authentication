@@ -1,5 +1,5 @@
 import { Module, type DynamicModule, type OnModuleInit } from '@nestjs/common';
-import { APP_INTERCEPTOR } from '@nestjs/core';
+import { APP_INTERCEPTOR, ModuleRef } from '@nestjs/core';
 import { EmailVerificationService } from './account/email-verification.service.js';
 import { PasswordResetService } from './account/password-reset.service.js';
 import {
@@ -36,6 +36,11 @@ import { SignInService } from './session/sign-in.service.js';
  * `AuthenticationContext` around each handler, `AuthenticationRegistry`,
  * where the app's credential providers and feature handlers register, and
  * `AuthenticationStorage`, where its stores do.
+ *
+ * Global enhancers do not reach everywhere by default: a hybrid app's
+ * message handlers need `app.connectMicroservice(options, { inheritAppConfig:
+ * true })`, and GraphQL field resolvers `fieldResolverEnhancers: ['guards',
+ * 'interceptors']`, or the guard does not run there.
  */
 @Module({
   providers: [
@@ -87,6 +92,7 @@ export class AuthenticationModule extends ConfigurableModuleClass implements OnM
   constructor(
     private readonly registry: AuthenticationRegistry,
     private readonly storage: AuthenticationStorage,
+    private readonly moduleRef: ModuleRef,
   ) {
     super();
   }
@@ -105,5 +111,30 @@ export class AuthenticationModule extends ConfigurableModuleClass implements OnM
   onModuleInit() {
     this.registry[LOCK_REGISTRY]();
     this.storage[LOCK_STORAGE]();
+    assertGraphqlContextPerRequest(this.moduleRef);
+  }
+}
+
+/**
+ * The guard authenticates a GraphQL operation from its context's `req`. A
+ * `context` given as an object is one object for every request, and
+ * `@nestjs/apollo` sets the first request as its `req` and keeps it: every
+ * later operation would be authenticated with the first caller's
+ * credentials. So such a configuration fails at startup.
+ */
+function assertGraphqlContextPerRequest(moduleRef: ModuleRef) {
+  let options: { context?: unknown } | undefined;
+  try {
+    options = moduleRef.get<{ context?: unknown }>('GqlModuleOptions', { strict: false });
+  } catch {
+    return; // no GraphQL module
+  }
+
+  if (typeof options?.context === 'object' && options.context !== null) {
+    throw new Error(
+      'AuthenticationModule: the GraphQL module’s `context` is an object, shared by every request: the first ' +
+        'request is kept as its `req`, and every later operation would be authenticated as that caller. Make it a ' +
+        'function that builds one per request: `context: ({ req, res }) => ({ req, res, ...yourValues })`.',
+    );
   }
 }

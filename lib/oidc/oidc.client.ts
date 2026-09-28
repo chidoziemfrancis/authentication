@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { randomToken, safeEqual } from '../utils/crypto.util.js';
+import { randomToken, safeEqual, sha256 } from '../utils/crypto.util.js';
 import { durationOr } from '../utils/duration.util.js';
 import { JwksClient } from '../jwt/jwks.client.js';
 import { JwtError } from '../errors/jwt.error.js';
@@ -20,17 +20,21 @@ interface Endpoints {
 
 const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]']);
 
-/** Only https, except loopback http (local IdPs and tests). */
+/**
+ * Only https, except loopback http (local IdPs and tests). The URLs come from the provider's
+ * discovery document or the app's configuration, never from the user: a bad one is a
+ * misconfiguration (`unavailable`, a 502), not a failed sign-in.
+ */
 function assertSecureUrl(value: string | undefined, what: string): string {
   let url: URL;
   try {
     url = new URL(value ?? '');
   } catch {
-    throw new OidcError(`${what} is not a URL`, 'verification');
+    throw new OidcError(`${what} is not a URL`, 'unavailable');
   }
 
   if (url.protocol !== 'https:' && !(url.protocol === 'http:' && LOOPBACK.has(url.hostname))) {
-    throw new OidcError(`${what} must use https`, 'verification');
+    throw new OidcError(`${what} must use https`, 'unavailable');
   }
   return url.toString();
 }
@@ -64,11 +68,19 @@ export class OidcClient {
     }
   }
 
+  /**
+   * The provider's authorization URL, the transaction to store, and the
+   * browser binding for the transaction cookie. `state` is the SHA-256 of
+   * `binding`: the state travels in URLs (access logs, history, the error
+   * page of a failed callback), so it must not be what the cookie holds, or
+   * whoever reads a callback URL could redeem it from any client.
+   */
   async authorizationRequest(redirectUri: string, redirectTo?: string, ttlMs = 600_000) {
     const endpoints = await this.endpoints();
     const now = this.now();
+    const binding = randomToken();
     const transaction: OidcTransaction = {
-      state: randomToken(),
+      state: sha256(binding),
       provider: this.name,
       codeVerifier: randomToken(),
       ...(this.kind === 'oidc' && { nonce: randomToken() }),
@@ -94,7 +106,7 @@ export class OidcClient {
       url.searchParams.set(key, value);
     }
 
-    return { url: url.toString(), transaction };
+    return { url: url.toString(), transaction, binding };
   }
 
   /** Completes the flow. The caller has already matched `state` to the browser and loaded `transaction`. */
@@ -135,20 +147,26 @@ export class OidcClient {
 
     const claims = await this.verifyIdToken(endpoints, tokens.idToken, transaction.nonce!);
     let merged: Record<string, unknown> = claims;
+    let info: Record<string, unknown> | undefined;
     if (endpoints.userinfo_endpoint) {
-      const info = await userinfo(endpoints.userinfo_endpoint);
+      info = await userinfo(endpoints.userinfo_endpoint);
       if (info?.sub !== claims.sub) {
         throw new OidcError('userinfo subject mismatch', 'verification');
       }
       merged = { ...info, ...claims };
     }
 
+    // The address and whether it is verified come as a pair, from one source: the ID token's, or
+    // else userinfo's. `email_verified` in one says nothing about an `email` in the other.
+    const addressed = typeof claims.email === 'string' ? claims : (info ?? {});
+    const email = typeof addressed.email === 'string' ? addressed.email : undefined;
+
     return {
       profile: {
         provider: this.name,
         subject: claims.sub!,
-        email: typeof merged.email === 'string' ? merged.email : undefined,
-        emailVerified: merged.email_verified === true,
+        email,
+        emailVerified: email !== undefined && addressed.email_verified === true,
         name: typeof merged.name === 'string' ? merged.name : undefined,
         picture: typeof merged.picture === 'string' ? merged.picture : undefined,
         claims: merged,
@@ -181,7 +199,8 @@ export class OidcClient {
       if (error instanceof JwtError) {
         throw new OidcError(`id_token ${error.message}`, 'verification');
       }
-      throw error;
+      // The provider's key set could not be loaded: an outage (502), as any other of the provider's.
+      throw new OidcError((error as Error).message, 'unavailable');
     }
 
     if (typeof claims.sub !== 'string' || !claims.sub) {
@@ -296,8 +315,11 @@ export class OidcClient {
     };
   }
 
-  private async getJson(url: string, accessToken: string, name = url): Promise<any> {
-    const response = await this.request(assertSecureUrl(url, 'API url'), {
+  private async getJson(url: string, accessToken: string, what?: string): Promise<any> {
+    const target = new URL(assertSecureUrl(url, 'API url'));
+    // Errors reach responses and logs: name the host and path, never a query that may carry secrets.
+    const name = what ?? `${target.host}${target.pathname}`;
+    const response = await this.request(target.toString(), {
       headers: { accept: 'application/json', authorization: `Bearer ${accessToken}` },
     });
 

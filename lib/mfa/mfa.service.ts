@@ -3,6 +3,7 @@ import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { AUTHENTICATION_MODULE_OPTIONS } from '../authentication.constants.js';
 import { safeEqual } from '../utils/crypto.util.js';
 import { durationOr } from '../utils/duration.util.js';
+import { requireIntegerOption } from '../utils/options.util.js';
 import { AuthenticationStorage } from '../storage/authentication.storage.js';
 import { AuthenticationEvents } from '../events/authentication-events.service.js';
 import type { MfaStore } from '../interfaces/mfa-store.interface.js';
@@ -90,10 +91,17 @@ export class MfaService {
     if (this.options.encryption) {
       this.cipher = new SecretCipher(this.options.encryption);
     }
+
+    // A `NaN` limit would never be reached: every guess would be checked.
+    requireIntegerOption(this.options.maxAttempts, 'mfa.maxAttempts', { min: 1 });
+    // Each step either side adds two codes that every guess may hit; 30 would be seconds, not steps.
+    requireIntegerOption(this.options.window, 'mfa.window', { min: 0, max: 10 });
+    requireIntegerOption(this.options.recoveryCodes, 'mfa.recoveryCodes', { min: 1 });
   }
 
   async isEnrolled(userId: string): Promise<boolean> {
-    return (await this.store.getTotp(userId))?.confirmed === true;
+    // Truthy, not `=== true`: a store that reads the flag back as `1` must not skip the second factor.
+    return !!(await this.store.getTotp(userId))?.confirmed;
   }
 
   /**
@@ -139,9 +147,10 @@ export class MfaService {
       return false;
     }
 
-    const latest = (await this.store.getTotp(userId)) ?? record; // carries the claimed step
-    const stillPending = record.confirmed ? latest.pendingSecret === candidate : latest.secret === candidate;
-    if (!stillPending) {
+    // Read again: it carries the step just claimed, and a disable() or re-enrollment meanwhile wins.
+    const latest = await this.store.getTotp(userId);
+    const stillPending = !!latest && (record.confirmed ? latest.pendingSecret === candidate : latest.secret === candidate);
+    if (!latest || !stillPending) {
       return false; // re-enrolled or disabled concurrently
     }
 
@@ -164,8 +173,9 @@ export class MfaService {
     }
 
     if (opened.needsReencrypt) {
-      const latest = (await this.store.getTotp(userId)) ?? record; // keeps the claimed step
-      if (latest.secret === record.secret) {
+      // Read again: it keeps the claimed step, and an authenticator disabled or replaced meanwhile stays so.
+      const latest = await this.store.getTotp(userId);
+      if (latest?.secret === record.secret) {
         await this.store.saveTotp(userId, { ...latest, secret: this.seal(userId, opened.plaintext) });
       }
     }
@@ -190,11 +200,23 @@ export class MfaService {
       return false;
     }
 
-    await this.store.saveTotp(userId, { ...record, secret: this.seal(userId, opened.plaintext) });
+    // Read again before writing: a disable() or a confirmed replacement meanwhile must stay.
+    const latest = await this.store.getTotp(userId);
+    if (latest?.secret !== record.secret) {
+      return false;
+    }
+    await this.store.saveTotp(userId, { ...latest, secret: this.seal(userId, opened.plaintext) });
     return true;
   }
 
-  /** Returns fresh plaintext codes (show once); replaces any previous batch. */
+  /**
+   * Returns fresh plaintext codes (show once); replaces any previous batch.
+   * Codes are a second factor: for a user with a confirmed authenticator,
+   * call it right after `confirm()` succeeded, or from a route that requires
+   * a verified second factor (`@Authenticate({ mfa: true })`). Otherwise an
+   * API key, or a token issued before the user enrolled, could mint codes
+   * that finish a sign-in with the password alone.
+   */
   async generateRecoveryCodes(userId: string): Promise<string[]> {
     const codes = Array.from({ length: this.options?.recoveryCodes ?? 10 }, () => {
       const chars = Array.from({ length: 10 }, () => CODE_ALPHABET[randomInt(CODE_ALPHABET.length)]).join('');
@@ -231,6 +253,12 @@ export class MfaService {
     return this.store.countRecoveryCodes(userId);
   }
 
+  /**
+   * Removes the authenticator and the recovery codes. Call it only from a
+   * route that requires a verified second factor
+   * (`@Authenticate({ mfa: true })`): an API key, or a token issued before
+   * the user enrolled, is no second factor.
+   */
   async disable(userId: string): Promise<void> {
     await this.store.saveTotp(userId, null);
     await this.store.saveRecoveryCodes(userId, []);
@@ -327,6 +355,11 @@ export class MfaService {
       key = base32Decode(secret);
     } catch {
       return undefined; // not a base32 secret (e.g. ciphertext stored while `encryption: false`)
+    }
+    // RFC 4226 §4 asks for 128 bits at least (enroll() makes 160): an empty secret (a NULL column
+    // read back as '') would give codes anyone can compute.
+    if (key.length < 16) {
+      return undefined;
     }
 
     const current = totpStep(Math.floor(this.now() / 1000), PERIOD);

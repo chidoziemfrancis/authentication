@@ -31,8 +31,9 @@ export interface EmailTokenRecord {
  * (`DELETE … RETURNING`, `GETDEL`), so a link works once however many
  * requests present it. Anyone can ask for a reset link, so the store must
  * stay bounded: drop expired tokens as new ones are saved, and cap the
- * rest. The README's "Implementing a store" section has the rules method by
- * method.
+ * rest. Each method's comment has its rule, and
+ * `authenticationStoreContract()` from `@nestjs/authentication/testing`
+ * checks them.
  */
 export interface EmailTokenStore {
   /**

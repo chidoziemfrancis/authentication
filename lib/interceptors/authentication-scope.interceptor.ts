@@ -4,7 +4,7 @@ import { catchError, from, mergeMap, Observable, throwError } from 'rxjs';
 import { getAuthState } from '../utils/auth-state.util.js';
 import { AuthenticationError } from '../errors/authentication.error.js';
 import { refusal } from '../utils/transport-errors.util.js';
-import { AuthenticationScope, type Scope } from '../context/authentication-scope.service.js';
+import { AuthenticationScope, runCall, type Scope } from '../context/authentication-scope.service.js';
 
 /**
  * @internal Opens the scope with what the guard recorded, around the
@@ -27,7 +27,7 @@ export class AuthenticationScopeInterceptor implements NestInterceptor {
     const scope: Scope = { result: getAuthState(context) ?? null, context };
 
     return new Observable<unknown>((subscriber) =>
-      this.scope.run(scope, () => next.handle().subscribe(subscriber)),
+      this.scope.run(scope, () => runCall(scope, () => next.handle().subscribe(subscriber))),
     ).pipe(
       catchError((error: unknown) => {
         if (!(error instanceof AuthenticationError)) {

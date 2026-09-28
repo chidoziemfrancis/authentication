@@ -493,7 +493,7 @@ describe.each(adapters.map((a) => a.name))('authentication e2e (%s)', (adapter) 
     const requestLink = async (email: string, redirectTo?: string) => {
       const res = await http().post('/auth/magic').send({ email, redirectTo }).expect(202);
       expect(res.headers['set-cookie']).toEqual([
-        expect.stringMatching(/^__Host-magic_link_tx=[\w-]{43}; Max-Age=900; Path=\/; HttpOnly; Secure; SameSite=Lax$/),
+        expect.stringMatching(/^__Host-magic_link_tx=[\w-]{12}\.[\w-]{43}; Max-Age=900; Path=\/; HttpOnly; Secure; SameSite=Lax$/),
       ]);
       return { token: new URL(outbox.at(-1)!.url).searchParams.get('token')!, tx: cookieOf(res, '__Host-magic_link_tx') };
     };

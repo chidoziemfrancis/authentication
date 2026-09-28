@@ -1,5 +1,9 @@
 export interface MagicLinkRecord {
-  /** SHA-256 of the token. */
+  /**
+   * SHA-256 of the token, and of the secret that binds the link to the
+   * browser that requested it (`magicLink.bindToBrowser`): the link alone
+   * does not find it.
+   */
   id: string;
   email: string;
   createdAt: Date;

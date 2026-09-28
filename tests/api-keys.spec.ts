@@ -160,6 +160,10 @@ describe('ApiKeyProvider: verification', () => {
     });
     await expect(provider.authenticate(bearer(forever.key))).resolves.toMatchObject({ session: { method: 'api-key', keyId: forever.id } });
 
+    // An expiry the table cannot give back (a date column read wrong) is past, not absent.
+    const unreadable = provider.add('shelter', new Date(Number.NaN));
+    expect((await rejection(provider.authenticate(bearer(unreadable.key)))).message).toBe('api key expired');
+
     // Someone without the secret learns nothing about the key, its expiry included.
     const guess = `${expired.key.slice(0, -43)}${provider.generate().key.slice(-43)}`;
     expect((await rejection(provider.authenticate(bearer(guess)))).message).toBe('invalid api key');

@@ -100,7 +100,7 @@ class Handlers extends MagicLinkHandler {
     links.push(link);
   }
   resolveUser(email: string) {
-    return { id: email.split('@')[0] };
+    return { id: email.split('@')[0], email };
   }
 }
 
@@ -115,7 +115,7 @@ class ResetHandler extends PasswordResetHandler {
   }
   findUser(email: string) {
     const id = email.split('@')[0];
-    return this.accounts.emails.has(id) ? { id, passwordHash: this.accounts.hashes.get(id) ?? null } : null;
+    return this.accounts.emails.has(id) ? { id, email, passwordHash: this.accounts.hashes.get(id) ?? null } : null;
   }
   send(link: PasswordResetLink) {
     links.push(link);

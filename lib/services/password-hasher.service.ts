@@ -22,6 +22,41 @@ function scrypt(password: Buffer, salt: Buffer, keyLength: number, { logN, r, p 
 const b64 = (buf: Buffer) => buf.toString('base64').replace(/=+$/, '');
 
 /**
+ * @internal The bytes `PasswordHasher` derives from: the password NFKC-normalised, as UTF-8. Throws
+ * for anything but a string, for an empty one (which no account should have), and past 4 KiB,
+ * which caps what a request can make scrypt read.
+ */
+export function encodePassword(password: unknown): Buffer {
+  if (typeof password !== 'string') {
+    throw new TypeError('password must be a string');
+  }
+  // Before normalising, which can multiply the length (U+FDFA is 18 characters in NFKC): a string
+  // longer than the limit in UTF-16 units is longer in UTF-8 bytes too.
+  if (password.length > MAX_PASSWORD_BYTES) {
+    throw new RangeError('password too long');
+  }
+
+  const input = Buffer.from(password.normalize('NFKC'), 'utf8');
+  if (input.length === 0) {
+    throw new RangeError('password is empty');
+  }
+  if (input.length > MAX_PASSWORD_BYTES) {
+    throw new RangeError('password too long');
+  }
+  return input;
+}
+
+/** @internal Whether `PasswordHasher.hash()` takes `password` (see {@link encodePassword}). */
+export function isHashablePassword(password: unknown): password is string {
+  try {
+    encodePassword(password);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * scrypt password hashing (Node's `crypto.scrypt`, run on the libuv
  * threadpool so it does not block the event loop).
  *
@@ -31,7 +66,10 @@ const b64 = (buf: Buffer) => buf.toString('base64').replace(/=+$/, '');
  * fresh hash while it has the plaintext.
  *
  * Passwords are NFKC-normalised (NIST SP 800-63B §5.1.1.2) so the same
- * password typed on different keyboards verifies.
+ * password typed on different keyboards verifies. `hash()` refuses an empty
+ * password and one over 4 KiB (a `RangeError`), and `verify()` answers
+ * `false` for them without any work; length and strength rules beyond that
+ * are the app's to check.
  *
  * The module provides one built from its `password` option. Tests replace
  * it with a cheaper one: `new PasswordHasher({ logN: 10 })`.
@@ -48,6 +86,12 @@ export class PasswordHasher {
     this.saltLength = options.saltLength ?? 16;
     if (!isSane(this.params)) {
       throw new RangeError('PasswordHasher: unsupported scrypt parameters');
+    }
+    // What `parse()` reads back: a hash made with anything else would never verify.
+    for (const [name, value] of [['keyLength', this.keyLength], ['saltLength', this.saltLength]] as const) {
+      if (!Number.isInteger(value) || value < 16 || value > 64) {
+        throw new RangeError(`PasswordHasher: \`${name}\` must be an integer from 16 to 64 bytes, got ${String(value)}`);
+      }
     }
   }
 
@@ -68,7 +112,11 @@ export class PasswordHasher {
   async verify(password: string, encoded: string | null | undefined): Promise<boolean> {
     if (!encoded) {
       if (!this.dummy) {
-        this.dummy = this.hash('dummy password for timing equalisation');
+        // A failure (a cancelled worker, memory) is not kept: the next unknown user tries again.
+        this.dummy = this.hash('dummy password for timing equalisation').catch((error: unknown) => {
+          this.dummy = undefined;
+          throw error;
+        });
         await this.dummy;
       } else {
         await this.verify(password, await this.dummy);
@@ -78,7 +126,9 @@ export class PasswordHasher {
 
     const parsed = parse(encoded);
     if (!parsed) {
-      return false;
+      // A disabled account (`!`), a hash from another scheme: the same work as an unknown user, so
+      // the answer's timing does not single these accounts out.
+      return this.verify(password, undefined);
     }
 
     let input: Buffer;
@@ -115,21 +165,24 @@ export class PasswordHasher {
   }
 
   private encodeInput(password: string): Buffer {
-    if (typeof password !== 'string') {
-      throw new TypeError('password must be a string');
-    }
-
-    const input = Buffer.from(password.normalize('NFKC'), 'utf8');
-    if (input.length > MAX_PASSWORD_BYTES) {
-      throw new RangeError('password too long');
-    }
-    return input;
+    return encodePassword(password);
   }
 }
 
 function isSane({ logN, r, p }: Params): boolean {
-  // Bounds also cap what a tampered stored hash can make us compute.
-  return logN >= 10 && logN <= 22 && r >= 1 && r <= 32 && p >= 1 && p <= 16;
+  // Bounds also cap what a tampered stored hash can make us compute: 1 GiB of memory (128·N·r),
+  // and 16 times the work of the default parameters (N·r·p).
+  return (
+    [logN, r, p].every(Number.isInteger) &&
+    logN >= 10 &&
+    logN <= 22 &&
+    r >= 1 &&
+    r <= 32 &&
+    p >= 1 &&
+    p <= 16 &&
+    2 ** logN * r <= 2 ** 23 &&
+    2 ** logN * r * p <= 2 ** 24
+  );
 }
 
 function parse(encoded: string): { params: Params; salt: Buffer; hash: Buffer } | undefined {
@@ -145,7 +198,7 @@ function parse(encoded: string): { params: Params; salt: Buffer; hash: Buffer } 
 
   const salt = Buffer.from(match[4], 'base64');
   const hash = Buffer.from(match[5], 'base64');
-  if (hash.length < 16 || hash.length > 64) {
+  if (hash.length < 16 || hash.length > 64 || salt.length > 64) {
     return undefined;
   }
 

@@ -36,7 +36,7 @@ class LinkMailer extends MagicLinkHandler {
     outbox.push(link);
   }
   resolveUser(email: string) {
-    return email.startsWith('blocked') ? null : { id: email.split('@')[0] };
+    return email.startsWith('blocked') ? null : { id: email.split('@')[0], email };
   }
 }
 

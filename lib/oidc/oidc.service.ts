@@ -14,8 +14,8 @@ import { AuthenticationScope } from '../context/authentication-scope.service.js'
 import { AuthenticationRegistry } from '../services/authentication-registry.service.js';
 import { AuthenticationStorage } from '../storage/authentication.storage.js';
 import { AUTHENTICATION_MODULE_OPTIONS } from '../authentication.constants.js';
-import { safeEqual, safeRedirectPath } from '../utils/crypto.util.js';
-import { durationOr } from '../utils/duration.util.js';
+import { safeEqual, safeRedirectPath, sha256 } from '../utils/crypto.util.js';
+import { durationOr, hasExpired } from '../utils/duration.util.js';
 import { requireOption } from '../utils/options.util.js';
 import { defaultCookieName, readCookie, serializeCookie } from '../session/cookies.util.js';
 import { SessionService } from '../session/session.service.js';
@@ -61,11 +61,13 @@ const header = (headers: Headers, name: string) => {
  * ```
  *
  * The transaction (PKCE verifier, nonce, return path) stays server-side,
- * keyed by `state`; the browser gets `state` in an `HttpOnly` cookie. The
- * callback must present the same value in the query and the cookie, which
- * binds the response to the browser that started the login (login CSRF).
- * `SameSite=Lax` lets the cookie through the IdP's top-level redirect, and
- * the `__Host-` prefix keeps sibling subdomains from planting one.
+ * keyed by `state`; the browser gets, in an `HttpOnly` cookie, the secret
+ * whose SHA-256 is the `state`. The callback must present both, which binds
+ * the response to the browser that started the login: another browser
+ * cannot finish it (login CSRF), nor can whoever reads the callback URL in a
+ * log or a history. `SameSite=Lax` lets the cookie through the IdP's
+ * top-level redirect, and the `__Host-` prefix keeps sibling subdomains from
+ * planting one.
  *
  * `start(provider, { link: true })` begins a link flow for the signed-in
  * user instead of a sign-in: the callback re-checks that the same session is
@@ -125,6 +127,11 @@ export class OidcService {
 
     let linking: OidcTransaction['link'];
     if (link) {
+      // A link attaches whatever account the provider has signed in on this browser: never at the
+      // bidding of another site's page (a top-level navigation carries the Lax session cookie).
+      if (header(req.headers, 'sec-fetch-site') === 'cross-site') {
+        throw new ForbiddenException('Cross-site link refused');
+      }
       const session = await this.currentSession(req);
       if (!session) {
         throw new UnauthorizedException('sign in to link an account');
@@ -132,11 +139,11 @@ export class OidcService {
       linking = { userId: session.userId, sessionId: session.id };
     }
 
-    const { url, transaction } = await this.client(provider)
+    const { url, transaction, binding } = await this.client(provider)
       .authorizationRequest(this.callbackUrl(provider), safeRedirectPath(redirectTo), this.transactionTtl)
       .catch(toHttp);
     await this.storage.oidcStates.saveOidcState({ ...transaction, ...(linking && { link: linking }) });
-    return this.redirect(exchange?.response, url, [this.txCookie(transaction.state, this.transactionTtl / 1000)]);
+    return this.redirect(exchange?.response, url, [this.txCookie(binding, this.transactionTtl / 1000)]);
   }
 
   /**
@@ -150,14 +157,16 @@ export class OidcService {
     const exchange = this.scope.exchange();
     const req = request ?? exchange?.request ?? { headers: {} };
 
+    // The cookie holds the secret whose SHA-256 is the state. The state travels in URLs, the
+    // secret never does: a callback URL read from a log is useless without this browser's cookie.
     const state = query.state;
     const bound = readCookie(header(req.headers, 'cookie'), this.txCookieName);
-    if (typeof state !== 'string' || !bound || !safeEqual(state, bound)) {
+    if (typeof state !== 'string' || !bound || !safeEqual(sha256(bound), state)) {
       throw new BadRequestException('state mismatch');
     }
 
     const transaction = await this.storage.oidcStates.consumeOidcState(state);
-    if (!transaction || transaction.provider !== provider || this.now() >= transaction.expiresAt.getTime()) {
+    if (!transaction || transaction.provider !== provider || hasExpired(transaction.expiresAt, this.now())) {
       throw new BadRequestException('unknown or expired login');
     }
 
@@ -184,8 +193,10 @@ export class OidcService {
       throw new ForbiddenException('account not allowed');
     }
 
-    await this.signIn.signIn(user.id, { method: `oidc:${provider}` });
-    return this.redirect(exchange?.response, location, [this.txCookie('', 0)]);
+    const issued = await this.signIn.signIn(user.id, { method: `oidc:${provider}` });
+    // `signIn()` set the session cookie on the response itself; the caller outside HTTP needs it too.
+    const { url } = this.redirect(exchange?.response, location, [this.txCookie('', 0)]);
+    return { url, cookies: [issued.cookie, this.txCookie('', 0)] };
   }
 
   /** Sets the cookies (and `no-store`) on the HTTP response, if there is one. */

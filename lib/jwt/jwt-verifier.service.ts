@@ -22,8 +22,11 @@ export class JwtVerifier {
       throw new TypeError('JwtVerifier: pass exactly one of `key` or `jwks`.');
     }
 
+    let given: KeyObject | undefined;
     if (options.key) {
-      this.key = toKeyObject(options.key);
+      given = toKeyObject(options.key);
+      // A private key verifies with its public half, derived once.
+      this.key = given.type === 'private' ? createPublicKey(given) : given;
     }
     if (options.jwks) {
       this.jwks = typeof options.jwks === 'string' ? new JwksClient(options.jwks) : options.jwks;
@@ -35,25 +38,20 @@ export class JwtVerifier {
         throw new TypeError(`JwtVerifier: ${this.key.asymmetricKeyType} keys are not supported.`);
       }
       this.algorithms = options.algorithms ?? [implied];
-
-      // A private key verifies with its public half.
-      const verifying = this.key.type === 'private' ? createPublicKey(this.key) : this.key;
       for (const alg of this.algorithms) {
-        assertKeyFits(alg, verifying, 'JwtVerifier');
+        assertKeyFits(alg, this.key, 'JwtVerifier');
+      }
+      // A public key is someone else's, an identity provider's that signs every client's tokens with
+      // it, as with a JWKS. A secret or a private key is the app's own (`verifierForSigner()`).
+      if (given?.type === 'public') {
+        requireIssuerAndAudience(options, 'public `key`');
       }
     } else {
       this.algorithms = options.algorithms ?? ['RS256', 'ES256'];
       if (this.algorithms.includes('HS256')) {
         throw new TypeError('JwtVerifier: HS256 cannot be combined with a JWKS.');
       }
-      if (typeof options.issuer !== 'string' || options.audience === undefined) {
-        throw new TypeError(
-          'JwtVerifier: a `jwks` verifier needs `issuer` and `audience`. An identity provider signs tokens for ' +
-            'all of its clients with the same keys, so without them tokens issued to other applications verify ' +
-            'too. For tokens that carry no audience, pass `audience: false` and check the claim that names your ' +
-            'client in `validate()`.',
-        );
-      }
+      requireIssuerAndAudience(options, '`jwks`');
     }
 
     // Invalid durations fail here, not at the first request.
@@ -73,10 +71,7 @@ export class JwtVerifier {
     if (header.crit !== undefined) {
       throw new JwtError('unsupported critical header');
     }
-    if (
-      this.options.type !== undefined &&
-      (typeof header.typ !== 'string' || header.typ.toLowerCase() !== this.options.type.toLowerCase())
-    ) {
+    if (this.options.type !== undefined && (typeof header.typ !== 'string' || mediaType(header.typ) !== mediaType(this.options.type))) {
       throw new JwtError('unexpected token type');
     }
 
@@ -86,6 +81,29 @@ export class JwtVerifier {
 
     return decoded.payload;
   }
+}
+
+/** Throws unless the tokens of a key the app does not own are pinned to their issuer and to the app. */
+function requireIssuerAndAudience(options: JwtVerifierOptions, what: string) {
+  if (typeof options.issuer === 'string' && options.audience !== undefined) {
+    return;
+  }
+  throw new TypeError(
+    `JwtVerifier: a ${what} verifier needs \`issuer\` and \`audience\`. An identity provider signs tokens for ` +
+      'all of its clients with the same keys, so without them tokens issued to other applications verify ' +
+      'too. For tokens that carry no audience, pass `audience: false` and check the claim that names your ' +
+      'client in `validate()`.',
+  );
+}
+
+/**
+ * A `typ` as RFC 7515 §4.1.9 compares it: without regard to case, and with
+ * `application/` implied when it has no `/`, so `at+jwt` and
+ * `application/at+jwt` are one type (RFC 9068 §4 accepts both).
+ */
+function mediaType(typ: string): string {
+  const lower = typ.toLowerCase();
+  return lower.includes('/') ? lower : `application/${lower}`;
 }
 
 /**
@@ -106,6 +124,7 @@ export function verifierForSigner(
     now: signer.now,
     ...(alg && { algorithms: [alg] }),
     ...overrides,
-    key: key.type === 'private' ? createPublicKey(key) : key,
+    // The signer's own key (a secret or a private key): its tokens are the app's.
+    key,
   });
 }

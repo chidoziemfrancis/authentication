@@ -89,8 +89,9 @@ export class TypeOrmAuthenticationStore
     await this.manager.update(SessionEntity, { id, lastActiveAt: LessThan(lastActiveAt) }, { lastActiveAt });
   }
 
-  async deleteSession(id: string): Promise<void> {
-    await this.manager.delete(SessionEntity, { id });
+  async deleteSession(id: string): Promise<boolean> {
+    const { affected } = await this.manager.delete(SessionEntity, { id });
+    return (affected ?? 0) > 0;
   }
 
   async listUserSessions(userId: string): Promise<SessionRecord[]> {

@@ -32,7 +32,7 @@ export class InMemorySessionStore implements SessionStore {
   }
 
   async deleteSession(id: string) {
-    this.sessions.delete(id);
+    return this.sessions.delete(id);
   }
 
   async listUserSessions(userId: string) {

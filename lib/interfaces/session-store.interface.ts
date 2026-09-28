@@ -17,9 +17,8 @@ export interface SessionRecord {
 /**
  * Where sessions live. Implement it on your database or Redis, and register
  * the provider with `AuthenticationStorage.registerSource({ sessions: this })`.
- * The README's "Implementing a store" section has the rules method by
- * method; `authenticationStoreContract()` from `@nestjs/authentication/testing`
- * checks them.
+ * Each method's comment has its rule, and `authenticationStoreContract()`
+ * from `@nestjs/authentication/testing` checks them.
  *
  * Optional fields come back absent (`undefined`), never `null`. Times come
  * from `SessionService`'s clock, never the store's.
@@ -41,8 +40,14 @@ export interface SessionStore {
    * sign-out or rotation deleted it bring it back. Changes no other field.
    */
   touchSession(id: string, lastActiveAt: Date): Promise<void>;
-  /** Deletes the session; nothing happens if it doesn't exist. */
-  deleteSession(id: string): Promise<void>;
+  /**
+   * Deletes the session, and resolves whether this call deleted it: one
+   * statement (`DELETE … WHERE id = ?` and its row count, Redis `DEL` and its
+   * count), `false` when it was already gone. `SessionService.rotate()`
+   * relies on it: of a rotation and a revocation of one session (or two
+   * rotations), only one may win.
+   */
+  deleteSession(id: string): Promise<boolean>;
   /** The user's sessions, in any order (`[]` when none), expired ones included. */
   listUserSessions(userId: string): Promise<SessionRecord[]>;
   /** Deletes every session of the user ("sign out everywhere"). */

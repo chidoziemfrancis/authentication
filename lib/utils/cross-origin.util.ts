@@ -16,14 +16,18 @@ const DEFAULT_PORTS: Record<string, string> = { 'http:': '80', 'https:': '443' }
  *    HTTP/2, else `Host`), ignoring case and the scheme's default port.
  *
  * A request whose `Origin` is one of `trusted` never is. A WebSocket
- * handshake has no method here: it opens a channel that carries writes, so
- * steps 2 to 4 apply to it (cross-site WebSocket hijacking).
+ * handshake (no method here, or a GET with `Upgrade: websocket`) opens a
+ * channel that carries writes, so steps 2 to 4 apply to it (cross-site
+ * WebSocket hijacking).
  */
 export function isCrossOriginWrite(
   request: { headers: Headers; method?: string },
   trusted: ReadonlySet<string>,
 ): boolean {
-  if (request.method !== undefined && SAFE_METHODS.has(request.method)) {
+  // A GET that upgrades to a WebSocket (graphql-ws hands resolvers its upgrade request) opens a
+  // channel that carries writes: a handshake, not a safe request.
+  const upgrade = header(request.headers, 'upgrade')?.toLowerCase() === 'websocket';
+  if (request.method !== undefined && SAFE_METHODS.has(request.method) && !upgrade) {
     return false;
   }
 

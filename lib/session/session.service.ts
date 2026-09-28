@@ -3,7 +3,7 @@ import { firstHeader } from '../utils/auth-state.util.js';
 import { AUTHENTICATION_MODULE_OPTIONS } from '../authentication.constants.js';
 import { isCrossOriginWrite, normalizeOrigin } from '../utils/cross-origin.util.js';
 import { TOKEN_PATTERN, randomToken, sha256 } from '../utils/crypto.util.js';
-import { durationOr } from '../utils/duration.util.js';
+import { durationOr, hasExpired } from '../utils/duration.util.js';
 import type { Duration } from '../interfaces/duration.interface.js';
 import { AuthenticationEvents } from '../events/authentication-events.service.js';
 import type { MfaState } from '../interfaces/authentication-result.interface.js';
@@ -45,6 +45,14 @@ export class SessionService {
     this.pendingTtl = Math.min(durationOr(options?.mfa?.pendingTtl, '10m'), this.absoluteTtl);
     this.idleTtl = durationOr(this.options.idleTtl, '1d');
     this.touchInterval = durationOr(this.options.touchInterval, '1m');
+    // Activity is recorded at most once per touchInterval: at or past idleTtl, a user active all
+    // along would be signed out as idle.
+    if (this.idleTtl > 0 && this.touchInterval >= this.idleTtl) {
+      throw new TypeError(
+        `session.touchInterval (${this.touchInterval} ms) must be shorter than session.idleTtl (${this.idleTtl} ms): ` +
+          'activity is recorded at most once per touchInterval, so active users would be signed out as idle.',
+      );
+    }
 
     this.cookieName = this.options.cookieName ?? defaultCookieName('sid', this.options.cookie);
     assertCookieAttributes(this.cookieName, this.options.cookie, 'session');
@@ -96,7 +104,7 @@ export class SessionService {
       // Past its absolute expiry, nothing can revive it. Idle, it is only idle as this read saw
       // it: another request (another instance's clock) may have touched it since, so it stays;
       // the store prunes it once its absolute expiry passes.
-      if (now >= record.expiresAt.getTime()) {
+      if (hasExpired(record.expiresAt, now)) {
         await this.storage.sessions.deleteSession(record.id);
       }
       return null;
@@ -116,17 +124,30 @@ export class SessionService {
    * current browser and updates its cookie. A pending session rotated to
    * `mfa: 'verified'` gets the absolute lifetime a verified sign-in has,
    * `absoluteTtl` from its creation, in place of its `mfa.pendingTtl`.
+   * Resolves `null` when the session was gone by the time it was replaced:
+   * revoked (a sign-out everywhere, a password reset) or rotated by another
+   * request, which leaves no new session behind.
    */
-  async rotate(session: SessionRecord, changes: Pick<Partial<SessionRecord>, 'mfa' | 'metadata'> = {}): Promise<IssuedSession> {
-    await this.storage.sessions.deleteSession(session.id);
+  async rotate(
+    session: SessionRecord,
+    changes: Pick<Partial<SessionRecord>, 'mfa' | 'metadata'> = {},
+  ): Promise<IssuedSession | null> {
     const { id: _, ...rest } = session;
     const verifying = session.mfa === 'pending' && changes.mfa === 'verified';
-    return this.issue({
+    // The new session first, then the old one, which must still be there to delete: if a revocation
+    // took it meanwhile (deleting the user's sessions, this new one included, or not yet), or another
+    // rotation did, this one lost, and its new session must not outlive the old.
+    const issued = await this.issue({
       ...rest,
       ...changes,
       lastActiveAt: new Date(this.now()),
       ...(verifying && { expiresAt: new Date(session.createdAt.getTime() + this.absoluteTtl) }),
     });
+    if (!(await this.storage.sessions.deleteSession(session.id))) {
+      await this.storage.sessions.deleteSession(issued.session.id);
+      return null;
+    }
+    return issued;
   }
 
   /**
@@ -192,12 +213,12 @@ export class SessionService {
   }
 
   /** @internal Deletes a session by id, for sessions whose user is gone. */
-  discard(sessionId: string): Promise<void> {
-    return this.storage.sessions.deleteSession(sessionId);
+  async discard(sessionId: string): Promise<void> {
+    await this.storage.sessions.deleteSession(sessionId);
   }
 
   private isLive(record: SessionRecord, now: number): boolean {
-    if (now >= record.expiresAt.getTime()) {
+    if (hasExpired(record.expiresAt, now)) {
       return false;
     }
     return this.idleTtl === 0 || now < record.lastActiveAt.getTime() + this.idleTtl;

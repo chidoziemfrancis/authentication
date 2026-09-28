@@ -18,12 +18,14 @@ import {
   type MagicLink,
   type MagicLinkOptions,
 } from '../lib/index.js';
+import { ForbiddenException } from '@nestjs/common';
 import { AuthenticationScope } from '../lib/context/authentication-scope.service.js';
+import { sha256 } from '../lib/utils/crypto.util.js';
 import { registryWith, storageWith } from './fixtures.js';
 
 class Mailer extends MagicLinkHandler {
   readonly sent: MagicLink[] = [];
-  readonly known = new Map([['ada@example.com', { id: 'u1' }]]);
+  readonly known = new Map([['ada@example.com', { id: 'u1', email: 'ada@example.com' }]]);
   send(link: MagicLink) {
     this.sent.push(link);
   }
@@ -77,7 +79,7 @@ describe('MagicLinkService in an HTTP exchange', () => {
     const { service, inRequest, mailer } = setup();
     const created = await inRequest({}, () => service.create('  ADA@example.com '));
 
-    expect(created.cookies).toEqual([expect.stringMatching(/^__Host-magic_link_tx=[\w-]{43}; Max-Age=600; Path=\/; HttpOnly; Secure; SameSite=Lax$/)]);
+    expect(created.cookies).toEqual([expect.stringMatching(/^__Host-magic_link_tx=[\w-]{12}\.[\w-]{43}; Max-Age=600; Path=\/; HttpOnly; Secure; SameSite=Lax$/)]);
     expect(created.value).toEqual({ expiresAt: mailer.sent[0].expiresAt, cookie: created.cookies[0] });
     expect(mailer.sent[0].email).toBe('ada@example.com');
   });
@@ -85,7 +87,7 @@ describe('MagicLinkService in an HTTP exchange', () => {
   it('keeps the transaction cookie SameSite=Lax whatever the options say: the link is opened from a mail client', async () => {
     const { service, inRequest } = setup({ cookie: { sameSite: 'strict', domain: 'app.test' } });
     const { cookies } = await inRequest({}, () => service.create('ada@example.com'));
-    expect(cookies[0]).toMatch(/^magic_link_tx=[\w-]{43}; Max-Age=600; Path=\/; Domain=app\.test; HttpOnly; Secure; SameSite=Lax$/);
+    expect(cookies[0]).toMatch(/^magic_link_tx=[\w-]{12}\.[\w-]{43}; Max-Age=600; Path=\/; Domain=app\.test; HttpOnly; Secure; SameSite=Lax$/);
   });
 
   it('signs in the browser that requested the link, clearing its transaction cookie and setting the session', async () => {
@@ -126,10 +128,97 @@ describe('MagicLinkService in an HTTP exchange', () => {
     expect(refused).toEqual({ value: null, cookies: [expect.stringMatching(/^__Host-magic_link_tx=; Max-Age=0; /)] });
     expect(seen).toEqual([{ type: 'magic-link-refused', reason: 'refused', email: 'stranger@example.com' }]);
 
-    mailer.known.set('stranger@example.com', { id: 'u9' }); // allowed now, but the link is spent
+    mailer.known.set('stranger@example.com', { id: 'u9', email: 'stranger@example.com' }); // allowed now, but the link is spent
     const again = await inRequest(cookieHeader(created.cookies[0]), () => service.consume(token));
     expect(again.value).toBeNull();
     expect(seen.at(-1)).toEqual({ type: 'magic-link-refused', reason: 'unknown' });
+  });
+
+  it('refuses to create a link from another site’s page, which would bind this browser to a link its author reads', async () => {
+    const { service, inRequest, mailer, links } = setup();
+    const save = vi.spyOn(links, 'saveMagicLink');
+
+    // A form on the attacker's page, auto-submitted with their own address (login CSRF).
+    const crossSite = await inRequest({ host: 'app.test', origin: 'https://evil.test', 'sec-fetch-site': 'cross-site' }, () =>
+      service.create('attacker@example.com'),
+    );
+    expect(crossSite.error).toBeInstanceOf(ForbiddenException);
+    expect(crossSite.cookies).toEqual([]);
+    expect(save).not.toHaveBeenCalled();
+    expect(mailer.sent).toEqual([]);
+
+    const own = await inRequest({ host: 'app.test', origin: 'https://app.test', 'sec-fetch-site': 'same-origin' }, () =>
+      service.create('ada@example.com'),
+    );
+    expect(own.cookies).toHaveLength(1);
+  });
+
+  it('finds nothing for a link read from a log or forwarded, whatever cookie is forged for it', async () => {
+    const { service, inRequest, mailer, tokenOf, cookieHeader, seen } = setup();
+    const created = await inRequest({}, () => service.create('ada@example.com'));
+    const token = tokenOf(mailer.sent[0]);
+    const [hint] = cookieHeader(created.cookies[0]).cookie.split('=')[1].split('.'); // computable from the link
+
+    // The SHA-256 of the token, which the cookie used to hold: not this browser's link.
+    const byHash = await inRequest({ cookie: `__Host-magic_link_tx=${sha256(token)}` }, () => service.consume(token));
+    expect(byHash.error).toBeInstanceOf(MagicLinkError);
+
+    // The right hint and a guessed secret: nothing is stored under that.
+    const guessed = await inRequest({ cookie: `__Host-magic_link_tx=${hint}.${'A'.repeat(43)}` }, () => service.consume(token));
+    expect(guessed.value).toBeNull();
+    expect(seen.at(-1)).toEqual({ type: 'magic-link-refused', reason: 'unknown' });
+
+    // Neither burned it: it still signs in the browser that requested it.
+    const opened = await inRequest(cookieHeader(created.cookies[0]), () => service.consume(token));
+    expect(opened.value).toMatchObject({ session: { userId: 'u1' } });
+  });
+
+  it('signs in only an account whose stored address is the one the link was sent to', async () => {
+    const { service, inRequest, mailer, tokenOf, cookieHeader, seen } = setup();
+    // A lookup that ignores accents, as MySQL's default collation does: `exämple.com` finds `example.com`.
+    const folded = (email: string) => email.normalize('NFD').replace(/\p{M}/gu, '');
+    mailer.resolveUser = (email: string) => (folded(email) === 'victim@example.com' ? { id: 'victim', email: 'victim@example.com' } : null);
+
+    const created = await inRequest({}, () => service.create('victim@exämple.com'));
+    expect(mailer.sent[0].email).toBe('victim@exämple.com'); // the attacker's mailbox, on their look-alike domain
+    const consumed = await inRequest(cookieHeader(created.cookies[0]), () => service.consume(tokenOf(mailer.sent[0])));
+    expect(consumed.value).toBeNull();
+    expect(seen.at(-1)).toEqual({ type: 'magic-link-refused', reason: 'refused', email: 'victim@exämple.com' });
+
+    // The case and the spaces of the stored address do not matter.
+    mailer.resolveUser = () => ({ id: 'victim', email: ' Victim@Example.COM ' });
+    const again = await inRequest({}, () => service.create('victim@example.com'));
+    const signedIn = await inRequest(cookieHeader(again.cookies[0]), () => service.consume(tokenOf(mailer.sent[1])));
+    expect(signedIn.value).toMatchObject({ session: { userId: 'victim' } });
+  });
+
+  it('needs the stored address from resolveUser(), and says so', async () => {
+    const { service, inRequest, mailer, tokenOf, cookieHeader } = setup();
+    mailer.known.set('ada@example.com', { id: 'u1' } as never);
+    const created = await inRequest({}, () => service.create('ada@example.com'));
+
+    const consumed = await inRequest(cookieHeader(created.cookies[0]), () => service.consume(tokenOf(mailer.sent[0])));
+    expect(consumed.error).toBeInstanceOf(TypeError);
+    expect((consumed.error as Error).message).toMatch(/^MagicLinkHandler\.resolveUser\(\) must return the account’s stored `email`/);
+  });
+
+  it('creates and sends nothing for an address no mail should go to, with the same answer', async () => {
+    const { service, inRequest, mailer } = setup();
+    const unmailable = [
+      'ada@example.com\r\nBcc: everyone@example.com',
+      'a da@example.com',
+      'no-at-sign',
+      '@example.com',
+      'ada@',
+      `${'a'.repeat(243)}@example.com`, // 255 characters
+    ];
+    for (const email of unmailable) {
+      expect(await inRequest({}, () => service.create(email))).toEqual({ value: { expiresAt: expect.any(Date) }, cookies: [] });
+    }
+    expect(mailer.sent).toEqual([]);
+
+    await inRequest({}, () => service.create(`${'a'.repeat(242)}@example.com`)); // 254: the most RFC 5321 allows
+    expect(mailer.sent).toHaveLength(1);
   });
 
   it('refuses a malformed token as unknown, before checking the browser', async () => {

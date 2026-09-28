@@ -11,6 +11,7 @@ import {
   AuthenticationEvents,
   AuthenticationGuard,
   AuthenticationProvider,
+  InMemoryEmailTokenStore,
   InMemoryMagicLinkStore,
   InMemoryMfaStore,
   InMemoryOidcStateStore,
@@ -41,6 +42,7 @@ import { sha256, safeRedirectPath } from '../lib/utils/crypto.util.js';
 import { toMs } from '../lib/utils/duration.util.js';
 import { AuthenticationRegistry } from '../lib/services/authentication-registry.service.js';
 import { SecretCipher } from '../lib/mfa/secret-cipher.service.js';
+import { encodePassword } from '../lib/services/password-hasher.service.js';
 import { base32Decode, base32Encode, hotp } from '../lib/mfa/otp.util.js';
 import { readCookie } from '../lib/session/cookies.util.js';
 import { registryWith, storageWith } from './fixtures.js';
@@ -80,14 +82,94 @@ describe('PasswordHasher (scrypt)', () => {
 
   it('rejects malformed, tampered and absurd hashes without throwing', async () => {
     const hash = await fast.hash('pw');
-    for (const bad of ['', 'plain', hash.replace('ln=10', 'ln=40'), hash.replace('$scrypt$', '$bcrypt$'), `${hash}x!`]) {
+    const [, , , salt] = hash.split('$');
+    const derived = (bytes: number) => `$scrypt$ln=10,r=8,p=1$${salt}$${Buffer.alloc(bytes, 1).toString('base64').replace(/=+$/, '')}`;
+    for (const bad of ['', 'plain', hash.replace('ln=10', 'ln=40'), hash.replace('$scrypt$', '$bcrypt$'), `${hash}x!`, derived(15), derived(65)]) {
       await expect(fast.verify('pw', bad)).resolves.toBe(false);
       expect(fast.needsRehash(bad)).toBe(true);
     }
   });
 
+  it('refuses empty passwords, those over 4 KiB and non-strings: hash() throws, verify() answers false without deriving', async () => {
+    const hasher = new PasswordHasher({ logN: 10 });
+    const hash = await hasher.hash('pw');
+    const derive = vi.spyOn(hasher as unknown as { derive(...args: unknown[]): Promise<Buffer> }, 'derive');
+
+    const long = 'x'.repeat(4097);
+    await expect(hasher.hash(long)).rejects.toThrow(new RangeError('password too long'));
+    await expect(hasher.hash('')).rejects.toThrow(new RangeError('password is empty'));
+    await expect(hasher.hash(42 as never)).rejects.toThrow(new TypeError('password must be a string'));
+    await expect(hasher.verify(long, hash)).resolves.toBe(false);
+    await expect(hasher.verify('', hash)).resolves.toBe(false);
+    await expect(hasher.verify(undefined as never, hash)).resolves.toBe(false);
+    expect(derive).not.toHaveBeenCalled(); // a megabyte password costs nothing
+
+    // The limit counts UTF-8 bytes after normalisation: 1,366 three-byte characters are 4,098.
+    await expect(hasher.hash('€'.repeat(1366))).rejects.toThrow('password too long');
+    await expect(hasher.verify('€'.repeat(1365), await hasher.hash('€'.repeat(1365)))).resolves.toBe(true);
+  });
+
   it('refuses unsupported parameters up front', () => {
     expect(() => new PasswordHasher({ logN: 30 })).toThrow(RangeError);
+    // A fraction would fail every hash(), and lengths `parse()` refuses would never verify.
+    expect(() => new PasswordHasher({ logN: 10.5 })).toThrow('PasswordHasher: unsupported scrypt parameters');
+    expect(() => new PasswordHasher({ logN: 22, r: 8 })).toThrow('PasswordHasher: unsupported scrypt parameters'); // 4 GiB
+    expect(() => new PasswordHasher({ keyLength: 8 })).toThrow('PasswordHasher: `keyLength` must be an integer from 16 to 64 bytes, got 8');
+    expect(() => new PasswordHasher({ keyLength: 65 })).toThrow(/`keyLength` must be an integer from 16 to 64/);
+    expect(() => new PasswordHasher({ saltLength: 0 })).toThrow('PasswordHasher: `saltLength` must be an integer from 16 to 64 bytes, got 0');
+    expect(() => new PasswordHasher({ saltLength: 16.5 })).toThrow(/`saltLength` must be an integer/);
+    expect(() => new PasswordHasher({ logN: 20, r: 8, keyLength: 64, saltLength: 64 })).not.toThrow(); // 1 GiB: the most
+  });
+
+  it('refuses stored hashes that would demand more than the bounds, or carry a salt over 64 bytes', async () => {
+    const hash = await fast.hash('pw');
+    const [, , , salt, key] = hash.split('$');
+    const stored = (params: string, saltPart = salt) => `$scrypt$${params}$${saltPart}$${key}`;
+
+    const derive = vi.spyOn(fast as unknown as { derive(...args: unknown[]): Promise<Buffer> }, 'derive');
+    try {
+      for (const tampered of [stored('ln=22,r=32,p=16'), stored('ln=20,r=16,p=1'), stored('ln=17,r=8,p=16', Buffer.alloc(65).toString('base64').replace(/=+$/, ''))]) {
+        await expect(fast.verify('pw', tampered)).resolves.toBe(false);
+        // Only the dummy's work: never the parameters the row asked for.
+        for (const [, , , params] of derive.mock.calls) {
+          expect(params).toEqual({ logN: 10, r: 8, p: 1 });
+        }
+      }
+    } finally {
+      derive.mockRestore();
+    }
+  });
+
+  it('spends the dummy’s work on a stored hash it cannot read, as on an unknown user', async () => {
+    const hasher = new PasswordHasher({ logN: 10 });
+    await hasher.verify('pw', undefined); // makes the dummy
+    const derive = vi.spyOn(hasher as unknown as { derive(...args: unknown[]): Promise<Buffer> }, 'derive');
+
+    // A disabled account, a hash from another scheme, a truncated one.
+    for (const unreadable of ['!', '*', '$2b$12$R9h/cIPz0gi.URNNX3kh2OPST9/PgBkqquzi.Ss7KIUgO2t0jWMUW', '$scrypt$ln=10']) {
+      await expect(hasher.verify('pw', unreadable)).resolves.toBe(false);
+    }
+    expect(derive).toHaveBeenCalledTimes(4);
+  });
+
+  it('forgets a dummy hash that failed, so the next unknown user tries again rather than failing forever', async () => {
+    const hasher = new PasswordHasher({ logN: 10 });
+    const derive = vi.spyOn(hasher as unknown as { derive(...args: unknown[]): Promise<Buffer> }, 'derive');
+    derive.mockRejectedValueOnce(new Error('thread pool busy'));
+
+    await expect(hasher.verify('pw', undefined)).rejects.toThrow('thread pool busy');
+    await expect(hasher.verify('pw', undefined)).resolves.toBe(false);
+  });
+
+  it('refuses an over-long password before normalising it, which can multiply its length', () => {
+    // U+FDFA is one UTF-16 unit and 18 characters in NFKC.
+    const normalize = vi.spyOn(String.prototype, 'normalize');
+    try {
+      expect(() => encodePassword('ﷺ'.repeat(4097))).toThrow(new RangeError('password too long'));
+      expect(normalize).not.toHaveBeenCalled();
+    } finally {
+      normalize.mockRestore();
+    }
   });
 
   it('spends the same work for unknown users, from the first request on', async () => {
@@ -120,7 +202,7 @@ describe('TOTP', () => {
     expect(base32Encode(Buffer.from('foobar'))).toBe('MZXW6YTBOI'); // RFC 4648 §10, unpadded
   });
 
-  function setup(options: { lockoutWindow?: '1m' } = {}) {
+  function setup(options: { lockoutWindow?: '1m'; window?: number } = {}) {
     let clock = 1_700_000_000_000;
     const store = new InMemoryMfaStore();
     const events = new AuthenticationEvents();
@@ -177,6 +259,36 @@ describe('TOTP', () => {
 
     tick(60_000);
     await expect(mfa.verifyTotp('u1', code(secret))).resolves.toBe(true);
+  });
+
+  it('accepts only the current step with `window: 0`', async () => {
+    const { mfa, code, tick } = setup({ window: 0 });
+    const { secret } = await mfa.enroll('u1', 'alice');
+    await expect(mfa.confirm('u1', code(secret, -1))).resolves.toBe(false);
+    await expect(mfa.confirm('u1', code(secret, 1))).resolves.toBe(false);
+    await expect(mfa.confirm('u1', code(secret))).resolves.toBe(true);
+
+    tick(30_000);
+    await expect(mfa.verifyTotp('u1', code(secret))).resolves.toBe(true);
+  });
+
+  it('refuses at startup the limits that a missing environment variable would switch off', () => {
+    const configure = (options: object) => () =>
+      new MfaService(storageWith({ mfa: new InMemoryMfaStore() }), { mfa: { encryption: false, ...options } });
+
+    // `Number(process.env.X)` of an unset variable: no count ever reaches a `NaN` limit.
+    expect(configure({ maxAttempts: Number(process.env.NO_SUCH_LIMIT) })).toThrow(
+      'AuthenticationModule: `mfa.maxAttempts` must be an integer of at least 1, but it is NaN: is the environment variable it reads set?',
+    );
+    expect(configure({ maxAttempts: 0 })).toThrow('`mfa.maxAttempts` must be an integer of at least 1, but it is 0.');
+    expect(configure({ maxAttempts: '5' })).toThrow('`mfa.maxAttempts` must be an integer of at least 1, but it is "5".');
+    // Seconds where steps are meant, fractions and negatives.
+    expect(configure({ window: 30 })).toThrow('AuthenticationModule: `mfa.window` must be an integer from 0 to 10, but it is 30.');
+    expect(configure({ window: 1.5 })).toThrow(/`mfa.window` must be an integer from 0 to 10/);
+    expect(configure({ window: -1 })).toThrow(/`mfa.window` must be an integer from 0 to 10/);
+    expect(configure({ recoveryCodes: 0 })).toThrow('`mfa.recoveryCodes` must be an integer of at least 1, but it is 0.');
+
+    expect(configure({ maxAttempts: 1, window: 10, recoveryCodes: 1 })).not.toThrow();
   });
 
   it('counts each guess before checking it: a burst of parallel guesses cannot outrun the lockout', async () => {
@@ -238,6 +350,44 @@ describe('TOTP', () => {
     await expect(mfa.verifyTotp('u1', code(old))).resolves.toBe(false);
     await expect(mfa.verifyTotp('u1', code(next))).resolves.toBe(true);
     await expect(mfa.confirm('u1', code(next, 1))).resolves.toBe(false); // nothing pending
+  });
+
+  it('a confirm() racing disable() leaves the authenticator disabled', async () => {
+    const { mfa, code } = setup();
+    const { secret } = await mfa.enroll('u1', 'alice');
+    // disable() lands between the code check and the write that confirms.
+    const store = (mfa as unknown as { store: InMemoryMfaStore }).store;
+    const claim = store.claimTotpStep.bind(store);
+    vi.spyOn(store, 'claimTotpStep').mockImplementation(async (userId, step) => {
+      const claimed = await claim(userId, step);
+      await mfa.disable(userId);
+      return claimed;
+    });
+
+    await expect(mfa.confirm('u1', code(secret))).resolves.toBe(false);
+    await expect(mfa.isEnrolled('u1')).resolves.toBe(false);
+    await expect(store.getTotp('u1')).resolves.toBeUndefined();
+  });
+
+  it('refuses codes of other forms before any check, counting each as a guess', async () => {
+    const { mfa, code, seen } = setup();
+    const { secret } = await mfa.enroll('u1', 'alice');
+    await mfa.confirm('u1', code(secret));
+    seen.length = 0;
+
+    const current = code(secret, 1);
+    const arabicIndic = [...current].map((d) => String.fromCharCode(0x0660 + Number(d))).join('');
+    for (const guess of [arabicIndic, ` ${current}`, `${current}0`, Number(current), [current]] as never[]) {
+      await expect(mfa.verifyTotp('u1', guess)).resolves.toBe(false);
+    }
+    expect(seen.filter((event) => event.type === 'mfa-failed')).toHaveLength(5);
+  });
+
+  it('counts a store’s truthy `confirmed` (a 1 from the database) as enrolled: the second factor is not skipped', async () => {
+    const store = new InMemoryMfaStore();
+    const mfa = new MfaService(storageWith({ mfa: store }), { mfa: { encryption: false } });
+    await store.saveTotp('u1', { secret: base32Encode(Buffer.alloc(20, 1)), confirmed: 1 as never });
+    await expect(mfa.isEnrolled('u1')).resolves.toBe(true);
   });
 
   it('after disable(), enrolling starts over', async () => {
@@ -341,11 +491,24 @@ describe('SessionService', () => {
     expect(await sessions.validate(token)).toBeNull();
   });
 
+  it('fails closed on an expiry the store cannot give back (an Invalid Date): the session is over', async () => {
+    const { sessions, store } = setup({ idleTtl: 0 }); // nothing but the absolute expiry ends it
+    const { token, session } = await sessions.create('u1');
+    const read = store.getSession.bind(store);
+    vi.spyOn(store, 'getSession').mockImplementation(async (id) => {
+      const record = await read(id);
+      return record && { ...record, expiresAt: new Date(Number.NaN) }; // a misnamed column, say
+    });
+
+    expect(await sessions.validate(token)).toBeNull();
+    await expect(read(session.id)).resolves.toBeUndefined(); // deleted, as past its expiry
+  });
+
   it('rotate() replaces the id and keeps the absolute expiry', async () => {
     const { sessions, tick } = setup();
     const first = await sessions.create('u1', { mfa: 'pending' });
     tick(10_000);
-    const second = await sessions.rotate(first.session, { mfa: 'verified' });
+    const second = (await sessions.rotate(first.session, { mfa: 'verified' }))!;
 
     expect(await sessions.validate(first.token)).toBeNull();
     const live = await sessions.validate(second.token);
@@ -390,7 +553,7 @@ describe('SessionService', () => {
     const pending = await sessions.create('u1', { mfa: 'pending' });
 
     tick(20_000);
-    const done = await sessions.rotate(pending.session, { mfa: 'verified' });
+    const done = (await sessions.rotate(pending.session, { mfa: 'verified' }))!;
     expect(done.session.expiresAt.getTime()).toBe(pending.session.createdAt.getTime() + 300_000);
     expect(done.cookie).toMatch(/Max-Age=280;/);
 
@@ -402,7 +565,7 @@ describe('SessionService', () => {
 
     // Rotating for another reason keeps a pending session pending, and short-lived.
     const other = await sessions.create('u2', { mfa: 'pending' });
-    const rotated = await sessions.rotate(other.session);
+    const rotated = (await sessions.rotate(other.session))!;
     expect(rotated.session).toMatchObject({ mfa: 'pending', expiresAt: other.session.expiresAt });
   });
 
@@ -476,6 +639,13 @@ describe('SessionService', () => {
     expect(sessions.tokenFrom({ headers: { cookie: `sid=${token}`, host: 'api.test', origin: 'https://evil.test' } })).toBeUndefined();
     expect(sessions.tokenFrom({ headers: { cookie: `sid=${token}`, host: 'api.test', origin: 'https://api.test' } })).toBe(token);
 
+    // So is the GET that upgrades to one, as graphql-ws hands it to resolvers as `req`.
+    const upgrade = (origin: string) =>
+      sessions.tokenFrom({ method: 'GET', headers: { cookie: `sid=${token}`, host: 'api.test', origin, upgrade: 'WebSocket' } });
+    expect(upgrade('https://evil.test')).toBeUndefined();
+    expect(upgrade('https://api.test')).toBe(token);
+    expect(sessions.tokenFrom({ method: 'GET', headers: { cookie: `sid=${token}`, host: 'api.test', origin: 'https://evil.test' } })).toBe(token);
+
     expect(() => setup({ trustedOrigins: ['https://shop.example.com/'] })).toThrow(
       'session.trustedOrigins: "https://shop.example.com/" is not an origin. Write it as scheme://host[:port], without a path.',
     );
@@ -520,6 +690,46 @@ describe('SessionService', () => {
     expect(await sessions.validate(rotated.token)).toBeNull();
   });
 
+  it('a rotation that races a revocation leaves no session behind, however the two interleave', async () => {
+    // The revocation lands before the new session is written, or between that and the old one's delete.
+    for (const when of ['before-issue', 'before-delete'] as const) {
+      const { sessions, store } = setup();
+      const { session } = await sessions.create('u1');
+      const create = store.createSession.bind(store);
+      vi.spyOn(store, 'createSession').mockImplementation(async (record) => {
+        if (when === 'before-issue') {
+          await sessions.revokeAll('u1');
+        }
+        await create(record);
+        if (when === 'before-delete') {
+          await sessions.revokeAll('u1');
+        }
+      });
+
+      await expect(sessions.rotate(session, { mfa: 'verified' })).resolves.toBeNull();
+      await expect(store.listUserSessions('u1')).resolves.toEqual([]);
+    }
+  });
+
+  it('of two rotations of one session, one wins: a session does not fork', async () => {
+    const { sessions, store } = setup();
+    const { session } = await sessions.create('u1');
+
+    const results = await Promise.all([sessions.rotate(session), sessions.rotate(session), sessions.rotate(session)]);
+    const winners = results.filter((issued) => issued !== null);
+    expect(winners).toHaveLength(1);
+    await expect(store.listUserSessions('u1')).resolves.toEqual([expect.objectContaining({ id: winners[0]!.session.id })]);
+  });
+
+  it('refuses a touchInterval at or past idleTtl: active users would be signed out as idle', () => {
+    expect(() => setup({ idleTtl: '30s', touchInterval: '1m' })).toThrow(
+      'session.touchInterval (60000 ms) must be shorter than session.idleTtl (30000 ms)',
+    );
+    expect(() => setup({ idleTtl: '1m', touchInterval: '1m' })).toThrow(/must be shorter than session\.idleTtl/);
+    expect(() => setup({ idleTtl: 0, touchInterval: '1h' })).not.toThrow(); // no idle timeout
+    expect(() => setup({ idleTtl: '30s', touchInterval: '10s' })).not.toThrow();
+  });
+
   it('list() leaves out sessions past their idle timeout', async () => {
     const { sessions, tick } = setup();
     const idle = await sessions.create('u1');
@@ -552,7 +762,7 @@ describe('TokenService', () => {
     );
 
     const record = (refreshToken: string) => store.getRefreshToken(sha256(refreshToken));
-    return { service, record, seen, tick: (ms: number) => (clock += ms) };
+    return { service, store, record, seen, tick: (ms: number) => (clock += ms) };
   }
 
   it('issues an access token and a refresh token; `expiresIn` is the access token lifetime in seconds', async () => {
@@ -577,6 +787,36 @@ describe('TokenService', () => {
 
     tick(700);
     await expect(service.refresh(current.refreshToken)).rejects.toMatchObject({ reason: 'expired' });
+  });
+
+  it('a store that fails mid-refresh leaves the token unspent: the client’s retry is a retry, not a theft', async () => {
+    const { service, store, seen } = setup();
+    const { refreshToken } = await service.issue('u1');
+
+    // Saving the successor fails, or spending the token does: either way nothing was spent.
+    vi.spyOn(store, 'saveRefreshToken').mockRejectedValueOnce(new Error('connection reset'));
+    await expect(service.refresh(refreshToken)).rejects.toThrow('connection reset');
+    vi.spyOn(store, 'markRefreshTokenUsed').mockRejectedValueOnce(new Error('connection reset'));
+    await expect(service.refresh(refreshToken)).rejects.toThrow('connection reset');
+
+    const retried = await service.refresh(refreshToken);
+    await expect(service.refresh(retried.refreshToken)).resolves.toMatchObject({ refreshToken: expect.any(String) });
+    expect(seen.map((event) => event.type)).toEqual(['sign-in']); // no theft reported, nobody signed out
+  });
+
+  it('treats a token whose expiry the store cannot give back (an Invalid Date) as expired, and does not spend it', async () => {
+    for (const field of ['expiresAt', 'familyExpiresAt'] as const) {
+      const { service, store } = setup();
+      const { refreshToken } = await service.issue('u1');
+      const read = store.getRefreshToken.bind(store);
+      vi.spyOn(store, 'getRefreshToken').mockImplementation(async (id) => {
+        const found = await read(id);
+        return found && { ...found, [field]: new Date(Number.NaN) }; // a misnamed column, say
+      });
+
+      await expect(service.refresh(refreshToken)).rejects.toMatchObject({ reason: 'expired' });
+      expect((await read(sha256(refreshToken)))!.usedAt).toBeUndefined();
+    }
   });
 
   it('an expired token retried is expired again, not a reuse; a spent token stays a reuse after it expires', async () => {
@@ -772,8 +1012,8 @@ describe('MagicLinkService', () => {
       send(link: { url: string }) {
         sent.push(link.url);
       }
-      resolveUser() {
-        return { id: 'u1' };
+      resolveUser(email: string) {
+        return { id: 'u1', email };
       }
     })();
 
@@ -824,7 +1064,7 @@ describe('MagicLinkService', () => {
   it('signs in through SignInService, outside HTTP too: the cookies are returned', async () => {
     const { service, sent, seen, tokenOf, browser } = setup();
     const created = await service.create('a@b.c');
-    expect(created.cookie).toMatch(/^__Host-magic_link_tx=[\w-]{43}; Max-Age=1; Path=\/; HttpOnly; Secure; SameSite=Lax$/);
+    expect(created.cookie).toMatch(/^__Host-magic_link_tx=[\w-]{12}\.[\w-]{43}; Max-Age=1; Path=\/; HttpOnly; Secure; SameSite=Lax$/);
 
     const result = await service.consume(tokenOf(sent[0]), browser(created.cookie));
     expect(result!.cookie).toMatch(/^__Host-sid=[\w-]{43}; /);
@@ -868,7 +1108,7 @@ describe('MagicLinkService', () => {
   it('names the cookie magic_link_tx when its attributes rule the __Host- prefix out', async () => {
     const { service } = setup(undefined, { cookie: { secure: false, sameSite: 'strict' } });
     const created = await service.create('a@b.c');
-    expect(created.cookie).toMatch(/^magic_link_tx=[\w-]{43}; Max-Age=1; Path=\/; HttpOnly; SameSite=Lax$/); // always Lax
+    expect(created.cookie).toMatch(/^magic_link_tx=[\w-]{12}\.[\w-]{43}; Max-Age=1; Path=\/; HttpOnly; SameSite=Lax$/); // always Lax
   });
 
   it('names the missing url at startup, and says how to enable the feature when it is off', async () => {
@@ -921,6 +1161,28 @@ describe('in-memory stores stay bounded', () => {
     await expect(links.consumeMagicLink('l4')).resolves.toBeUndefined();
     await expect(links.consumeMagicLink('l10004')).resolves.toMatchObject({ id: 'l10004' });
   });
+
+  it('cap email tokens, dropping the ones that expire first: reset links never push out a verification link', async () => {
+    const tokens = new InMemoryEmailTokenStore();
+    const now = Date.now();
+    const token = (id: string, purpose: 'password-reset' | 'email-verification', ttl: number) => ({
+      id,
+      purpose,
+      userId: 'u1',
+      email: 'a@b.c',
+      createdAt: new Date(now),
+      expiresAt: new Date(now + ttl),
+    });
+
+    await tokens.saveEmailToken(token('verify', 'email-verification', 86_400_000));
+    for (let i = 0; i < 10_000; i++) {
+      await tokens.saveEmailToken(token(`reset${i}`, 'password-reset', 3_600_000 + i));
+    }
+
+    await expect(tokens.consumeEmailToken('verify', 'email-verification')).resolves.toMatchObject({ id: 'verify' });
+    await expect(tokens.consumeEmailToken('reset0', 'password-reset')).resolves.toBeUndefined(); // expired first
+    await expect(tokens.consumeEmailToken('reset1', 'password-reset')).resolves.toMatchObject({ id: 'reset1' });
+  });
 });
 
 describe('helpers', () => {
@@ -938,12 +1200,34 @@ describe('helpers', () => {
     }
   });
 
+  it('safeRedirectPath keeps at most 2,048 characters: logins and links store it, and anyone can start one', () => {
+    expect(safeRedirectPath(`/${'a'.repeat(2_047)}`)).toHaveLength(2_048);
+    expect(safeRedirectPath(`/${'a'.repeat(2_048)}`)).toBeUndefined();
+  });
+
   it('readCookie parses the raw header', () => {
     expect(readCookie('a=1; sid=abc%3D; b=2', 'sid')).toBe('abc=');
     expect(readCookie('sid="quoted"', 'sid')).toBe('quoted');
     expect(readCookie('xsid=1; sid=2', 'sid')).toBe('2');
     expect(readCookie('sid=first; sid=second', 'sid')).toBe('first');
+    expect(readCookie(' \tsid=spaced \t', 'sid')).toBe('spaced');
     expect(readCookie(undefined, 'sid')).toBeUndefined();
+  });
+
+  it('readCookie strips only spaces and tabs, so a planted `\\xA0__Host-sid` is not `__Host-sid`', () => {
+    // A sibling subdomain may set `\xA0__Host-sid` with its own Domain and Path: browsers see no
+    // prefix on that name, store it, and send it first for the longer path. Node reads the byte as U+00A0.
+    for (const pad of [' ', '﻿', ' ']) {
+      expect(readCookie(`${pad}__Host-sid=planted; __Host-sid=genuine`, '__Host-sid')).toBe('genuine');
+      expect(readCookie(`${pad}__Host-sid=planted`, '__Host-sid')).toBeUndefined();
+    }
+  });
+
+  it('toMs refuses durations over 100 years, which would put every expiry past the range of Date', () => {
+    expect(toMs('36525d')).toBe(3_155_760_000_000); // 100 years, the most
+    for (const huge of [Number.MAX_SAFE_INTEGER, '100000000w', '36526d', 3_155_760_000_001] as never[]) {
+      expect(() => toMs(huge)).toThrow(/longer than 100 years/);
+    }
   });
 
   it('toMs reads milliseconds and unit strings, and rejects the rest', () => {
@@ -1311,6 +1595,59 @@ describe('TOTP secret encryption at rest', () => {
       }
     })();
     expect(error?.message).not.toContain('short-secret-value');
+  });
+
+  it('refuses a stored secret under 128 bits, an empty one included, whose codes anyone could compute', async () => {
+    for (const short of ['', base32Encode(Buffer.alloc(15, 9))]) {
+      const store = new InMemoryMfaStore();
+      await store.saveTotp('u1', { secret: short, confirmed: true });
+      const plaintext = service(store, { mfa: { now: () => clock, encryption: false } });
+      await expect(plaintext.verifyTotp('u1', hotp(base32Decode(short), Math.floor(clock / 30_000)))).resolves.toBe(false);
+
+      const migrating = service(store, { mfa: { now: () => clock, encryption: { keys: [K1], migratePlaintext: true } } });
+      await expect(migrating.verifyTotp('u1', hotp(base32Decode(short), Math.floor(clock / 30_000)))).resolves.toBe(false);
+    }
+  });
+
+  it('re-encrypting after a good code never brings back an authenticator disabled meanwhile', async () => {
+    const store = new InMemoryMfaStore();
+    const secret = await enrolled(withKeys(store, K1));
+    const rotated = withKeys(store, K2, K1); // K2 encrypts now; the secret is still under K1
+
+    // disable() lands between the code's check and the re-encryption's write.
+    const claim = store.claimTotpStep.bind(store);
+    vi.spyOn(store, 'claimTotpStep').mockImplementation(async (userId, step) => {
+      const claimed = await claim(userId, step);
+      await store.saveTotp(userId, null);
+      return claimed;
+    });
+
+    await rotated.verifyTotp('u1', code(secret));
+    await expect(store.getTotp('u1')).resolves.toBeUndefined();
+  });
+
+  it('a key-rotation job never brings back an authenticator replaced meanwhile', async () => {
+    const store = new InMemoryMfaStore();
+    await enrolled(withKeys(store, K1));
+    const app = withKeys(store, K1);
+    const job = withKeys(store, K2, K1);
+
+    // The user confirms a new authenticator between the job's read and its write.
+    let next = '';
+    let replacing = false;
+    const get = store.getTotp.bind(store);
+    vi.spyOn(store, 'getTotp').mockImplementation(async (userId) => {
+      const record = await get(userId);
+      if (!replacing) {
+        replacing = true; // before enroll(), which reads again
+        next = (await app.enroll(userId, userId, { replace: true })).secret;
+        await app.confirm(userId, code(next));
+      }
+      return record;
+    });
+
+    await expect(job.reencrypt('u1')).resolves.toBe(false);
+    await expect(withKeys(store, K2, K1).verifyTotp('u1', code(next, 1))).resolves.toBe(true); // the new one is active
   });
 
   it('migrates legacy plaintext secrets only when asked to', async () => {

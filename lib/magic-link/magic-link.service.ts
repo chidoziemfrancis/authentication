@@ -6,7 +6,7 @@ import { AuthenticationRegistry } from '../services/authentication-registry.serv
 import { AuthenticationStorage } from '../storage/authentication.storage.js';
 import { AUTHENTICATION_MODULE_OPTIONS } from '../authentication.constants.js';
 import { TOKEN_PATTERN, randomToken, safeEqual, safeRedirectPath, sha256 } from '../utils/crypto.util.js';
-import { durationOr } from '../utils/duration.util.js';
+import { durationOr, hasExpired } from '../utils/duration.util.js';
 import { AuthenticationEvents } from '../events/authentication-events.service.js';
 import type { AuthenticationMagicLinkRefusedEvent } from '../events/authentication-events.interface.js';
 import { requireUrlOption } from '../utils/options.util.js';
@@ -16,7 +16,21 @@ import { SignInService } from '../session/sign-in.service.js';
 import type { MagicLinkOptions, MagicLinkRequest, CreatedMagicLink } from '../interfaces/magic-link.interface.js';
 import { MagicLinkError } from '../errors/magic-link.error.js';
 import { MagicLinkHandler } from './magic-link.handler.js';
-import { normalizeEmail } from '../account/email.util.js';
+import { isMailableEmail, normalizeEmail } from '../account/email.util.js';
+
+/**
+ * What the store keys a link by: the SHA-256 of its token, and of the secret
+ * that binds it to a browser when it is bound (`bindToBrowser`), so the link
+ * alone finds nothing.
+ */
+function linkId(token: string, binding: string | undefined): string {
+  return sha256(binding === undefined ? token : `${token}.${binding}`);
+}
+
+/** Which link a browser's cookie is for: a public hint, computable from the link. */
+function hintOf(token: string): string {
+  return sha256(`nestjs-authentication magic-link hint ${token}`).slice(0, 12);
+}
 
 /**
  * Passwordless sign-in links: 256-bit single-use tokens, stored hashed,
@@ -26,15 +40,16 @@ import { normalizeEmail } from '../account/email.util.js';
  * link previews follow GET links, and would burn (or use) the token.
  *
  * Like `OidcService`, the service binds each link to the browser that
- * requested it: `create()` sets an `HttpOnly`, `SameSite=Lax` cookie,
- * `__Host-magic_link_tx`, holding the link's id (the SHA-256 of the token,
- * which is what the store keys the link by and which signs nobody in by
- * itself), and `consume()` requires the same value in the cookie. The
- * `__Host-` prefix keeps sibling subdomains from planting one. So the
- * link's page must be on the same site as the API, as the session cookie
- * requires anyway, and a link forwarded to another browser or device is
- * refused there while it stays usable where it was requested. See
- * `magicLink.bindToBrowser`.
+ * requested it: `create()` refuses a request from another origin (another
+ * site's page must not start a link here), and sets an `HttpOnly`,
+ * `SameSite=Lax` cookie, `__Host-magic_link_tx`, holding a secret that no
+ * link carries; the store keys the link by the token and that secret
+ * together, so `consume()` finds it only with the cookie. The `__Host-`
+ * prefix keeps sibling subdomains from planting one. So the link's page
+ * must be on the same site as the API, as the session cookie requires
+ * anyway, and a link forwarded to another browser or device, or read from
+ * a log, is refused there while it stays usable where it was requested.
+ * See `magicLink.bindToBrowser`.
  */
 @Injectable()
 export class MagicLinkService {
@@ -65,25 +80,32 @@ export class MagicLinkService {
    * Creates a link and hands it to `MagicLinkHandler.send()`. The token is
    * not returned. Called from an HTTP handler, it sets the transaction
    * cookie on the response (see `bindToBrowser`); the returned `cookie` is
-   * that `Set-Cookie` value, for callers outside HTTP. An `email` that isn't
-   * a non-blank string (a request body without it) creates and sends nothing,
-   * and gets the same answer, like `PasswordResetService.request()`.
+   * that `Set-Cookie` value, for callers outside HTTP. A request from another
+   * origin than the app's own and `session.trustedOrigins` gets a
+   * `ForbiddenException`, as `SignInService.signIn()` does. An `email` no
+   * mail should go to (missing, blank, without `@`, over 254 characters, or
+   * with whitespace or control characters) creates and sends nothing, and
+   * gets the same answer, like `PasswordResetService.request()`.
    */
   async create(email: string, { redirectTo }: { redirectTo?: string } = {}): Promise<CreatedMagicLink> {
     const { options, handler } = this.feature();
+    // The cookie binds the link to this browser: another site's page must not get one set here for
+    // an address its author reads (login CSRF), whatever the request asks for.
+    this.signIn.refuseCrossOrigin(this.scope.exchange()?.request);
+
     const now = this.now();
     const expiresAt = new Date(now + this.ttl);
 
     const normalized = typeof email === 'string' ? normalizeEmail(email) : '';
-    if (normalized === '') {
+    if (!isMailableEmail(normalized)) {
       return { expiresAt };
     }
 
     const token = randomToken();
+    const binding = this.bindToBrowser ? randomToken() : undefined;
     const safe = safeRedirectPath(redirectTo);
-    const id = sha256(token);
     await this.storage.magicLinks.saveMagicLink({
-      id,
+      id: linkId(token, binding),
       email: normalized,
       createdAt: new Date(now),
       expiresAt,
@@ -91,8 +113,8 @@ export class MagicLinkService {
     });
 
     let cookie: string | undefined;
-    if (this.bindToBrowser) {
-      cookie = this.txCookie(id, this.ttl / 1000);
+    if (binding) {
+      cookie = this.txCookie(`${hintOf(token)}.${binding}`, this.ttl / 1000);
       this.setCookie(cookie);
     }
 
@@ -123,30 +145,46 @@ export class MagicLinkService {
       return this.refuse('unknown');
     }
 
-    const id = sha256(token);
+    let binding: string | undefined;
     if (this.bindToBrowser) {
       const req = request ?? this.scope.exchange()?.request;
-      const bound = readCookie(firstHeader(req?.headers, 'cookie'), this.txCookieName);
-      // The cookie stays: it may belong to a link this browser did request, and the link stays
-      // for the browser that did. Nothing is looked up: a link was presented, not proved.
-      if (!bound || !safeEqual(bound, id)) {
+      const [hint, secret] = (readCookie(firstHeader(req?.headers, 'cookie'), this.txCookieName) ?? '').split('.');
+      // The hint names the link this browser requested; anyone holding the link can compute it, so it
+      // only tells a link opened elsewhere from a bad one. The secret, which no link carries, is what
+      // the link is stored under: a leaked or forwarded link finds nothing without it. On a refusal
+      // here the cookie stays (it may be for a link this browser did request), and nothing is looked
+      // up: a link was presented, not proved.
+      if (!hint || !secret || !TOKEN_PATTERN.test(secret) || !safeEqual(hint, hintOf(token))) {
         this.events.emit({ type: 'magic-link-refused', reason: 'not-this-browser' });
         throw new MagicLinkError();
       }
+      binding = secret;
     }
 
-    const record = await this.storage.magicLinks.consumeMagicLink(id);
+    const record = await this.storage.magicLinks.consumeMagicLink(linkId(token, binding));
     // This browser's link is settled either way: the cookie goes.
     this.setCookie(this.txCookie('', 0));
 
     if (!record) {
       return this.refuse('unknown');
     }
-    if (this.now() >= record.expiresAt.getTime()) {
+    if (hasExpired(record.expiresAt, this.now())) {
       return this.refuse('expired', record.email);
     }
     const user = await handler.resolveUser(record.email);
     if (!user) {
+      return this.refuse('refused', record.email);
+    }
+    // The link proved the address it was sent to, and signs in only the account whose address that
+    // is: a lookup that folds accents or ignores dots would otherwise hand `victim@exämple.com`'s
+    // mailbox the account of `victim@example.com`.
+    if (typeof user.email !== 'string') {
+      throw new TypeError(
+        'MagicLinkHandler.resolveUser() must return the account’s stored `email` with its `id`: the link signs in ' +
+          'only the account whose address it was sent to.',
+      );
+    }
+    if (normalizeEmail(user.email) !== record.email) {
       return this.refuse('refused', record.email);
     }
 

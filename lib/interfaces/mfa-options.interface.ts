@@ -9,13 +9,13 @@ export interface MfaOptions {
   encryption: SecretEncryptionOptions | false;
   /** Shown in authenticator apps. */
   issuer?: string;
-  /** Accepted 30-second steps either side of now. Default 1, per RFC 6238 §5.2. */
+  /** Accepted 30-second steps either side of now: an integer from 0 to 10. Default 1, per RFC 6238 §5.2. */
   window?: number;
-  /** Failed codes allowed per `lockoutWindow` before every code is refused. Default 5. */
+  /** Failed codes allowed per `lockoutWindow` before every code is refused: an integer of at least 1. Default 5. */
   maxAttempts?: number;
   /** Default `'15m'`. */
   lockoutWindow?: Duration;
-  /** Recovery codes per batch. Default 10. */
+  /** Recovery codes per batch: an integer of at least 1. Default 10. */
   recoveryCodes?: number;
   /**
    * How long a session that passed its first factor may wait for the second

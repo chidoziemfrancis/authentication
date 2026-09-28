@@ -124,9 +124,7 @@ describe('provider presets', () => {
       ...credentials,
     });
     for (const tenant of ['organizations', 'consumers']) {
-      expect(() => microsoft({ tenant, ...credentials })).toThrow(
-        `microsoft(): multi-tenant '${tenant}' is not supported; pass a tenant id or domain.`,
-      );
+      expect(() => microsoft({ tenant, ...credentials })).toThrow(`microsoft(): pass the tenant id, a GUID (Entra admin center, Overview), not "${tenant}"`);
     }
   });
 

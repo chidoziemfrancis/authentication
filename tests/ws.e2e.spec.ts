@@ -3,7 +3,7 @@ import type { AddressInfo } from 'node:net';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Logger, Module, type INestApplication } from '@nestjs/common';
 import { WsAdapter } from '@nestjs/platform-ws';
-import { MessageBody, SubscribeMessage, WebSocketGateway, type OnGatewayConnection } from '@nestjs/websockets';
+import { ConnectedSocket, MessageBody, SubscribeMessage, WebSocketGateway, type OnGatewayConnection } from '@nestjs/websockets';
 import request from 'supertest';
 import { WebSocket } from 'ws';
 import { adapters, createApp } from './support/adapters.js';
@@ -31,6 +31,13 @@ class ChatGateway implements OnGatewayConnection {
   @SubscribeMessage('ping')
   ping() {
     return { event: 'pong', data: { context: this.auth.user } };
+  }
+
+  // What each reader sees on a public message: the param, the context, and the socket's copy.
+  @Public()
+  @SubscribeMessage('public-who')
+  publicWho(@CurrentUser() user: User | null, @ConnectedSocket() client: WebSocket & { user?: User | null }) {
+    return { event: 'public-who', data: { param: user?.id ?? null, context: this.auth.user?.id ?? null, connection: client.user?.id ?? null } };
   }
 
   // requireUser() under a public message: an AuthenticationError, answered as a ws 401.
@@ -173,6 +180,26 @@ describe.each(adapters.map((a) => a.name))('WebSocket gateway on platform-ws (%s
 
     await request(app.getHttpServer()).post('/auth/logout').set('Cookie', cookie).expect(204);
     expect((await client.request('whoami')).event).toBe('exception');
+  });
+
+  it('gives a @Public() message no user, and a protected one its own, whatever the payload', async () => {
+    const client = await connect('/ws', { cookie: await loginCookie('bob@example.com') });
+    // A primitive payload shares nothing with the guard but the socket, which outlives the message.
+    for (const payload of ['hi', 42, {}]) {
+      expect((await client.request('public-who', payload)).data).toMatchObject({ param: null, context: null });
+      expect((await client.request('whoami', payload)).data).toEqual({ param: 'u2', context: 'u2' });
+    }
+  });
+
+  it('forgets the connection’s user once a message is refused for its credentials (a revoked session)', async () => {
+    const cookie = await loginCookie('bob@example.com');
+    const client = await connect('/ws', { cookie });
+    expect((await client.request('public-who', 'hi')).data.connection).toBe('u2'); // recorded at the handshake
+
+    await request(app.getHttpServer()).post('/auth/logout').set('Cookie', cookie).expect(204);
+    expect((await client.request('whoami', 'hi')).event).toBe('exception');
+    // What reads `client.user` (@nestjs/authorization on public messages) sees nobody now.
+    expect((await client.request('public-who', 'hi')).data).toEqual({ param: null, context: null, connection: null });
   });
 
   it('keeps per-message context separate for concurrent messages on different sockets', async () => {

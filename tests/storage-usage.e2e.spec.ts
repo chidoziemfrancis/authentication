@@ -222,12 +222,12 @@ describe('the production guard and what the features read', () => {
         magicLinks.push(url);
       }
       resolveUser(email: string) {
-        return { id: email.split('@')[0]! };
+        return { id: email.split('@')[0]!, email };
       }
     }
     class Resets extends PasswordResetHandler {
       findUser(email: string) {
-        return { id: email.split('@')[0]!, passwordHash: null };
+        return { id: email.split('@')[0]!, email, passwordHash: null };
       }
       send({ url }: { url: string }) {
         resetLinks.push(url);
@@ -277,7 +277,7 @@ describe('the production guard and what the features read', () => {
           expect(await sessions.validate(token)).toMatchObject({ userId: 'u1' });
           expect(await sessions.list('u1')).toHaveLength(1);
 
-          const rotated = await sessions.rotate(session);
+          const rotated = (await sessions.rotate(session))!;
           expect(await sessions.revoke(rotated.session.id, { userId: 'u1' })).toBe(true);
           await signIn.signOutEverywhere('u1');
 
@@ -354,7 +354,7 @@ describe('the production guard and what the features read', () => {
           const login = await oidc.start('mock', { request: { method: 'GET', headers: {} } });
           const state = new URL(login.url).searchParams.get('state')!;
           const code = idp.approve(login.url, { sub: 'alice-sub' });
-          await oidc.finish('mock', { state, code }, { request: { method: 'GET', headers: { cookie: `__Host-oidc_tx=${state}` } } });
+          await oidc.finish('mock', { state, code }, { request: { method: 'GET', headers: { cookie: login.cookies[0].split(';')[0] } } });
 
           // Linking reads the session that asks for it.
           const { token } = await app.get(SignInService).signIn('u1');

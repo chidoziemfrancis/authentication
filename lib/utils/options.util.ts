@@ -17,6 +17,28 @@ export function requireOption(value: unknown, option: string, what: string): voi
   );
 }
 
+/**
+ * `value`, when set, must be an integer from `min` to `max`. `Number(process.env.X)` of a variable
+ * that isn't set is `NaN`, and a comparison with `NaN` is always false: a limit set that way would
+ * silently stop limiting.
+ */
+export function requireIntegerOption(
+  value: unknown,
+  option: string,
+  { min, max = Number.MAX_SAFE_INTEGER }: { min: number; max?: number },
+): void {
+  if (value === undefined || (Number.isSafeInteger(value) && (value as number) >= min && (value as number) <= max)) {
+    return;
+  }
+
+  const range = max === Number.MAX_SAFE_INTEGER ? `of at least ${min}` : `from ${min} to ${max}`;
+  throw new TypeError(
+    `AuthenticationModule: \`${option}\` must be an integer ${range}, but it is ` +
+      `${typeof value === 'string' ? JSON.stringify(value) : String(value)}` +
+      (Number.isNaN(value) ? ': is the environment variable it reads set?' : '.'),
+  );
+}
+
 /** `value` must be an absolute http(s) URL. `what` describes it: `the page that receives the link`. */
 export function requireUrlOption(value: unknown, option: string, what: string): void {
   requireOption(value, option, what);

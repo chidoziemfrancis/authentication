@@ -76,8 +76,9 @@ export class DrizzleAuthenticationStore
       .where(and(eq(sessions.id, id), lt(sessions.lastActiveAt, lastActiveAt)));
   }
 
-  async deleteSession(id: string): Promise<void> {
-    await this.db.delete(sessions).where(eq(sessions.id, id));
+  async deleteSession(id: string): Promise<boolean> {
+    const deleted = await this.db.delete(sessions).where(eq(sessions.id, id)).returning({ id: sessions.id });
+    return deleted.length > 0;
   }
 
   async listUserSessions(userId: string): Promise<SessionRecord[]> {

@@ -47,7 +47,13 @@ export interface OidcProviderConfig {
   idTokenAlgorithms?: JwsAlgorithm[];
   /** Default `client_secret_basic` with a secret, `none` without (public client + PKCE). */
   tokenEndpointAuthMethod?: 'client_secret_basic' | 'client_secret_post' | 'none';
-  /** Extra authorization request parameters (`prompt`, `hd`, `login_hint`, …). */
+  /**
+   * Extra authorization request parameters (`prompt`, `hd`, `login_hint`,
+   * …). They travel through the browser, which can change or drop them:
+   * hints to the provider, never checks. Check what they ask for in the
+   * resolver, on the verified claims (`profile.claims.hd`, `acr`,
+   * `auth_time`).
+   */
   authorizationParams?: Record<string, string>;
   /** `oauth2` only: builds the profile from the userinfo response. */
   profile?(userinfo: any, context: ProfileContext): OidcProfile | Promise<OidcProfile>;

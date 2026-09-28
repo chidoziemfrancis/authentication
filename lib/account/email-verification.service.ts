@@ -3,12 +3,11 @@ import { AuthenticationRegistry } from '../services/authentication-registry.serv
 import { AuthenticationStorage } from '../storage/authentication.storage.js';
 import { AUTHENTICATION_MODULE_OPTIONS } from '../authentication.constants.js';
 import { TOKEN_PATTERN, randomToken, sha256 } from '../utils/crypto.util.js';
-import { durationOr } from '../utils/duration.util.js';
+import { durationOr, hasExpired } from '../utils/duration.util.js';
 import { AuthenticationEvents } from '../events/authentication-events.service.js';
 import { requireUrlOption } from '../utils/options.util.js';
 import type { EmailVerificationOptions } from '../interfaces/email-verification.interface.js';
 import { EmailVerificationHandler } from './email-verification.handler.js';
-import { normalizeEmail } from './email.util.js';
 
 /**
  * Email verification links: 256-bit single-use tokens, stored hashed, bound
@@ -43,7 +42,12 @@ export class EmailVerificationService {
    */
   async send(user: { id: string; email: string }): Promise<{ expiresAt: Date }> {
     const { options, handler } = this.feature();
-    const email = normalizeEmail(user.email);
+    // The address as the account has it: `markVerified()` compares it with the stored one, which
+    // may not be lowercase.
+    if (typeof user?.email !== 'string' || user.email.trim() === '') {
+      throw new TypeError('EmailVerificationService.send(): the user needs an `email` to send the link to.');
+    }
+    const email = user.email;
 
     const token = randomToken();
     const now = this.now();
@@ -77,7 +81,7 @@ export class EmailVerificationService {
     }
 
     const record = await this.storage.emailTokens.consumeEmailToken(sha256(token), 'email-verification');
-    if (!record || this.now() >= record.expiresAt.getTime()) {
+    if (!record || hasExpired(record.expiresAt, this.now())) {
       return null;
     }
     if (!(await handler.markVerified(record.userId, record.email))) {

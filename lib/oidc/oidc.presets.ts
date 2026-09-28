@@ -6,17 +6,25 @@ export function google(credentials: Credentials): OidcProviderConfig {
   return { issuer: 'https://accounts.google.com', ...credentials };
 }
 
+const TENANT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
- * Microsoft Entra ID, single tenant. Multi-tenant endpoints (`common`,
- * `organizations`, `consumers`) publish a templated issuer
- * (`https://login.microsoftonline.com/{tenantid}/v2.0`) that needs
- * per-token issuer validation against `tid`; not supported in this POC.
+ * Microsoft Entra ID, single tenant, by its tenant id (a GUID). Whatever
+ * name discovery is asked with, a domain included, Entra publishes the
+ * issuer of the tenant id, which must match exactly. Multi-tenant endpoints
+ * (`common`, `organizations`, `consumers`) publish a templated issuer
+ * (`https://login.microsoftonline.com/{tenantid}/v2.0`) that needs per-token
+ * issuer validation against `tid`; not supported.
  */
 export function microsoft({ tenant, ...credentials }: Credentials & { tenant: string }): OidcProviderConfig {
-  if (['common', 'organizations', 'consumers'].includes(tenant)) {
-    throw new Error(`microsoft(): multi-tenant '${tenant}' is not supported; pass a tenant id or domain.`);
+  if (typeof tenant !== 'string' || !TENANT_ID.test(tenant)) {
+    throw new Error(
+      `microsoft(): pass the tenant id, a GUID (Entra admin center, Overview), not ${JSON.stringify(tenant)}: ` +
+        'for a domain, and for the multi-tenant common, organizations and consumers, Microsoft publishes an ' +
+        'issuer that is not the one discovery was asked for, and every sign-in would fail.',
+    );
   }
-  return { issuer: `https://login.microsoftonline.com/${tenant}/v2.0`, ...credentials };
+  return { issuer: `https://login.microsoftonline.com/${tenant.toLowerCase()}/v2.0`, ...credentials };
 }
 
 /**
@@ -40,7 +48,9 @@ export function github(credentials: Credentials): OidcProviderConfig {
       const emails: { email: string; primary: boolean; verified: boolean }[] = await fetchJson(
         `${this.userinfoEndpoint}/emails`,
       );
-      const primary = Array.isArray(emails) ? emails.find((e) => e.primary && e.verified) : undefined;
+      const primary = Array.isArray(emails)
+        ? emails.find((e) => e?.primary === true && e.verified === true && typeof e.email === 'string')
+        : undefined;
 
       return {
         provider,

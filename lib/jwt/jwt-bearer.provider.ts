@@ -48,6 +48,15 @@ export abstract class JwtBearerProvider<TUser> extends AuthenticationProvider<TU
   constructor(private readonly options: JwtBearerProviderOptions = {}) {
     super();
     this.realm = options.realm ?? 'api';
+    // `super({ key: process.env.PARTNER_KEY })` with the variable unset must not fall back to the
+    // module's `accessToken`: this provider would take the app's own tokens as its issuer's.
+    const named = (['key', 'jwks'] as const).filter((name) => Object.hasOwn(options, name));
+    if (named.length > 0 && !options.key && !options.jwks) {
+      throw new TypeError(
+        `${new.target.name}: \`${named.join('` and `')}\` ${named.length > 1 ? 'are' : 'is'} empty: is the environment ` +
+          "variable it reads set? Leave both out to verify the tokens the module's `accessToken` issues.",
+      );
+    }
     if (options.key !== undefined || options.jwks !== undefined) {
       this.verifier = new JwtVerifier(options);
     }

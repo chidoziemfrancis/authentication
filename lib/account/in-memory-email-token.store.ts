@@ -10,7 +10,7 @@ const MAX_PENDING = 10_000;
 /**
  * Process-local store: the default when no source is registered, and a
  * test double. Drops expired tokens as new ones are saved, and holds at
- * most 10,000, dropping the oldest.
+ * most 10,000, dropping the one that expires first.
  */
 @Injectable()
 export class InMemoryEmailTokenStore implements EmailTokenStore {
@@ -28,11 +28,16 @@ export class InMemoryEmailTokenStore implements EmailTokenStore {
     }
 
     this.tokens.set(record.id, { ...record });
-    for (const id of this.tokens.keys()) {
-      if (this.tokens.size <= MAX_PENDING) {
-        break;
+    // Past the cap, the token that expires first goes, not the oldest: purposes have their own
+    // lifetimes, and a flood of one-hour reset links must not push out a day-long verification link.
+    if (this.tokens.size > MAX_PENDING) {
+      let first: EmailTokenRecord | undefined;
+      for (const token of this.tokens.values()) {
+        if (!first || token.expiresAt.getTime() < first.expiresAt.getTime()) {
+          first = token;
+        }
       }
-      this.tokens.delete(id); // insertion order: the oldest first
+      this.tokens.delete(first!.id);
     }
   }
 

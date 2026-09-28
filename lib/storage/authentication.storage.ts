@@ -20,7 +20,7 @@ import type {
 
 /**
  * @internal What each feature reads or writes, audited against the code
- * paths: the production guard's rule (and the README's "Storage" table).
+ * paths: the production guard's rule.
  * Any feature that signs someone in reads `mfa`, configured or not: a user
  * may have enrolled an authenticator through another instance, and
  * `MfaService.isEnrolled()` is how a sign-in finds out. Any feature that
@@ -285,7 +285,8 @@ export class AuthenticationStorage {
    * with `new`, outside the module, has no options: it refuses too.
    */
   private refusesInMemory(): boolean {
-    return process.env.NODE_ENV === 'production' && !this.requirements?.allowInMemoryStorage;
+    // `Production` and `production ` (a stray space in a .env file) are production too.
+    return process.env.NODE_ENV?.trim().toLowerCase() === 'production' && !this.requirements?.allowInMemoryStorage;
   }
 
   /**

@@ -85,7 +85,7 @@ class ResetMailer extends PasswordResetHandler {
   async findUser(email: string) {
     await sleep(lookupDelayMs); // a slow database: the request must not wait for it
     const row = this.accounts.byEmail(email);
-    return row ? { id: row.id, passwordHash: row.passwordHash } : null;
+    return row ? { id: row.id, email: row.email, passwordHash: row.passwordHash } : null;
   }
   send(link: PasswordResetLink) {
     mails.push(link);

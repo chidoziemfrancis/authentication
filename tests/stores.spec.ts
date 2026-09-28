@@ -50,6 +50,13 @@ class ReadThenWriteSessionStore extends InMemorySessionStore {
       await this.createSession({ ...record, lastActiveAt });
     }
   }
+
+  override async deleteSession(id: string) {
+    const found = (await this.getSession(id)) !== undefined;
+    await tick();
+    await super.deleteSession(id);
+    return found;
+  }
 }
 
 class ReadThenWriteRefreshTokenStore extends InMemoryRefreshTokenStore {
@@ -183,6 +190,8 @@ describe('the contract suite catches stores that read, then write', () => {
     expect(failed.sort()).toEqual(
       [
         'sessions: a request racing a sign-out or a rotation never brings the session back (SessionService)',
+        'sessions: of concurrent deletes of one session, exactly one resolves true (what keeps a rotation from outliving a revocation)',
+        'sessions: a rotation racing a sign-out leaves no session, and concurrent rotations leave one (SessionService)',
         'refreshTokens: markRefreshTokenUsed() succeeds once under concurrency',
         'refreshTokens: concurrent refreshes of one token revoke the family (TokenService)',
         'mfa: claimTotpStep() succeeds once under concurrency',

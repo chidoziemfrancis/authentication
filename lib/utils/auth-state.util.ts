@@ -2,6 +2,8 @@ import type { ExecutionContext } from '@nestjs/common';
 import type { AuthenticationResult } from '../interfaces/authentication-result.interface.js';
 
 const AUTH_STATE = Symbol.for('nestjs.authentication.state');
+/** The `session` this package last mirrored on a carrier, to tell it from another package's. */
+const MIRRORED_SESSION = Symbol.for('nestjs.authentication.mirrored-session');
 
 type Headers = Record<string, string | string[] | undefined>;
 type State = AuthenticationResult<any, any> | null;
@@ -74,7 +76,12 @@ export function setAuthState(context: ExecutionContext, result: State, { perCall
 
   carrier[AUTH_STATE] = result;
   carrier.user = result?.user ?? null;
-  carrier.session = result?.session ?? null;
+  // `request.session` is often another package's (express-session, @fastify/session): mirrored only
+  // where it is free, or still holds what this package put there.
+  if (!('session' in carrier) || carrier.session === carrier[MIRRORED_SESSION]) {
+    carrier.session = result?.session ?? null;
+    carrier[MIRRORED_SESSION] = carrier.session;
+  }
 }
 
 /**
@@ -97,8 +104,10 @@ const rawPerCall = new WeakMap<object, State>();
 
 /**
  * The providers' unfiltered answer, cached so a guard applied twice (global
- * plus `@UseGuards`, or GraphQL root and field resolvers sharing
- * `context.req`) authenticates once. Per message for ws.
+ * plus `@UseGuards`, or GraphQL root and field resolvers sharing one
+ * operation's context) authenticates once. Per message for ws, and per
+ * operation for GraphQL: over graphql-ws one upgrade request serves every
+ * operation of the socket, and each must see a revocation.
  */
 export function setRawResult(context: ExecutionContext, result: State) {
   if (context.getType() === 'ws') {
@@ -108,7 +117,7 @@ export function setRawResult(context: ExecutionContext, result: State) {
     return;
   }
 
-  const carrier = carrierOf(context);
+  const carrier = rawCarrierOf(context);
   if (carrier) {
     carrier[RAW] = result;
   }
@@ -124,8 +133,17 @@ export function getRawResult(context: ExecutionContext): State | undefined {
     return undefined;
   }
 
-  const carrier = carrierOf(context);
+  const carrier = rawCarrierOf(context);
   return carrier && RAW in carrier ? carrier[RAW] : undefined;
+}
+
+/** Where the raw answer is cached: the GraphQL operation's context, else the call's carrier. */
+function rawCarrierOf(context: ExecutionContext): Record<PropertyKey, any> | undefined {
+  if (context.getType<string>() === 'graphql') {
+    const operation = context.getArgByIndex(2);
+    return typeof operation === 'object' && operation !== null ? operation : undefined;
+  }
+  return carrierOf(context);
 }
 
 /**

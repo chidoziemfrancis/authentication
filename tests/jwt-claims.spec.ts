@@ -123,6 +123,17 @@ describe('JwtVerifier: claims', () => {
     expect(await refused(at.verify(hs256({ exp: NOW + 10 }, { alg: 'HS256', typ: ['at+jwt'] })))).toBe('unexpected token type');
   });
 
+  it('reads a `typ` without `/` as an `application/` media type (RFC 7515 §4.1.9), as RFC 9068 access tokens need', async () => {
+    const typed = (typ: string) => hs256({ exp: NOW + 10 }, { alg: 'HS256', typ });
+    for (const type of ['at+jwt', 'application/at+jwt', 'Application/AT+JWT']) {
+      const accepting = verifier({ type });
+      await expect(accepting.verify(typed('at+jwt'))).resolves.toBeTruthy();
+      await expect(accepting.verify(typed('application/at+jwt'))).resolves.toBeTruthy();
+      expect(await refused(accepting.verify(typed('jwt')))).toBe('unexpected token type');
+      expect(await refused(accepting.verify(typed('text/at+jwt')))).toBe('unexpected token type');
+    }
+  });
+
   it('refuses a header without an `alg` string as malformed, before anything else', async () => {
     expect(await refused(verifier().verify(hs256({ exp: NOW + 10 }, { typ: 'JWT' })))).toBe('malformed token');
     expect(await refused(verifier().verify(hs256({ exp: NOW + 10 }, { alg: 256 })))).toBe('malformed token');
@@ -152,6 +163,22 @@ describe('JwtVerifier and JwtSigner: configuration', () => {
 
     const broken = '-----BEGIN PUBLIC KEY-----\nnot base64 at all\n-----END PUBLIC KEY-----';
     expect(() => new JwtVerifier({ key: broken })).toThrow(/^Cannot read the PEM public key: /);
+  });
+
+  it('refuses a JWK passed as text, which would otherwise be an HS256 secret anyone holding the public key knows', async () => {
+    const pair = generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const publicJwk = JSON.stringify(pair.publicKey.export({ format: 'jwk' }));
+    const privateJwk = JSON.stringify(pair.privateKey.export({ format: 'jwk' }));
+
+    expect(() => new JwtVerifier({ key: publicJwk })).toThrow(/^The key is a JWK, which would be read as an HS256 secret/);
+    expect(() => new JwtVerifier({ key: Buffer.from(` \n${publicJwk}`) })).toThrow(/is a JWK/);
+    expect(() => new JwtSigner({ key: privateJwk })).toThrow(/is a JWK/);
+
+    // Text that only looks like JSON is still a secret.
+    expect(() => new JwtVerifier({ key: '{ not JSON at all, only a secret of 32+ bytes }' })).not.toThrow();
+    const secret = '{"not":"a key","padding":"to reach thirty-two bytes"}';
+    const token = new JwtSigner({ key: secret, now: nowMs }).sign({ sub: 'u1' });
+    await expect(new JwtVerifier({ key: secret, now: nowMs }).verify(token)).resolves.toMatchObject({ sub: 'u1' });
   });
 
   it('names what each algorithm needs', () => {
@@ -320,6 +347,16 @@ describe('JwtBearerProvider', () => {
     expect(() => unconfigured[PROVIDER_INIT]((() => undefined) as never)).toThrow(
       'Bearer: nothing to verify tokens with. Configure `accessToken` in the AuthenticationModule options, or pass `key` or `jwks` to super().',
     );
+  });
+
+  it('refuses a `key` or `jwks` given but empty, rather than take the app’s own tokens as the partner’s', async () => {
+    // `super({ key: process.env.PARTNER_KEY })` with the variable unset.
+    expect(() => new Bearer({ key: process.env.NO_SUCH_PARTNER_KEY })).toThrow(
+      'Bearer: `key` is empty: is the environment variable it reads set? Leave both out to verify the tokens the module’s `accessToken` issues.'.replace('’', "'"),
+    );
+    expect(() => new Bearer({ jwks: '' })).toThrow(/^Bearer: `jwks` is empty/);
+    expect(() => new Bearer({ key: undefined, jwks: undefined })).toThrow(/^Bearer: `key` and `jwks` are empty/);
+    expect(() => new Bearer({ key: undefined, jwks: 'https://idp.test/jwks', issuer: 'https://idp.test', audience: 'api' })).not.toThrow();
   });
 
   it('lets options passed to super() add rules to the module’s `accessToken`', async () => {

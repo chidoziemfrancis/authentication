@@ -26,8 +26,9 @@ export interface RefreshTokenRecord {
  * conditional write (`UPDATE … SET used_at = ? WHERE id = ? AND used_at IS
  * NULL`), never a read followed by a write. A family's revocation must
  * cover tokens saved *after* it: a refresh that lost the race to a reuse
- * may still save its successor. The README's "Implementing a store"
- * section has the rules method by method.
+ * may still save its successor. Each method's comment has its rule, and
+ * `authenticationStoreContract()` from `@nestjs/authentication/testing`
+ * checks them.
  *
  * Optional fields come back absent (`undefined`), never `null`. Times come
  * from `TokenService`'s clock, never the store's.

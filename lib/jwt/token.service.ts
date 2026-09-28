@@ -1,7 +1,7 @@
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { AUTHENTICATION_MODULE_OPTIONS } from '../authentication.constants.js';
 import { TOKEN_PATTERN, randomToken, sha256 } from '../utils/crypto.util.js';
-import { durationOr } from '../utils/duration.util.js';
+import { durationOr, hasExpired } from '../utils/duration.util.js';
 import { AuthenticationStorage } from '../storage/authentication.storage.js';
 import { AuthenticationError } from '../errors/authentication.error.js';
 import { AuthenticationEvents } from '../events/authentication-events.service.js';
@@ -116,23 +116,31 @@ export class TokenService {
     }
 
     const now = new Date(this.now());
-    const expired = now >= record.expiresAt || now >= record.familyExpiresAt;
+    const expired = hasExpired(record.expiresAt, now.getTime()) || hasExpired(record.familyExpiresAt, now.getTime());
     // An unspent token that expired is refused as such, and not spent: presenting it
     // again is a client retrying, not theft. A spent one stays a reuse, expired or not.
     if (expired && !record.usedAt) {
       throw new RefreshTokenError('expired');
     }
-    if (record.usedAt || !(await store.markRefreshTokenUsed(record.id, now))) {
-      await store.revokeRefreshTokenFamily(record.familyId);
-      this.events.emit({ type: 'refresh-token-reused', userId: record.userId, tokenFamilyId: record.familyId });
-      throw new RefreshTokenError('reused');
-    }
-    if (expired) {
-      throw new RefreshTokenError('expired');
+    if (record.usedAt) {
+      throw await this.reused(record);
     }
 
+    // The successor is saved before this token is spent: a store that fails in between leaves it
+    // unspent, so the client's retry is a retry, not a theft that signs the user out. If another
+    // request spent it first, revoking the family revokes this successor too.
     const next = await this.create(record.userId, record.familyId, record.familyExpiresAt, record.claims);
+    if (!(await store.markRefreshTokenUsed(record.id, now))) {
+      throw await this.reused(record);
+    }
     return this.pair(signer, next.token, next.record);
+  }
+
+  /** Two parties hold the token: the family is revoked, and the theft reported. */
+  private async reused(record: RefreshTokenRecord): Promise<RefreshTokenError> {
+    await this.storage.refreshTokens.revokeRefreshTokenFamily(record.familyId);
+    this.events.emit({ type: 'refresh-token-reused', userId: record.userId, tokenFamilyId: record.familyId });
+    return new RefreshTokenError('reused');
   }
 
   /**

@@ -1,4 +1,4 @@
-import type { MagicLink } from '../interfaces/magic-link.interface.js';
+import type { MagicLink, MagicLinkAccount } from '../interfaces/magic-link.interface.js';
 
 /**
  * Implemented by the app: delivery (the module ships no mailer) and the
@@ -14,5 +14,13 @@ import type { MagicLink } from '../interfaces/magic-link.interface.js';
  */
 export abstract class MagicLinkHandler {
   abstract send(link: MagicLink): void | Promise<void>;
-  abstract resolveUser(email: string): { id: string } | null | Promise<{ id: string } | null>;
+  /**
+   * The account for an address (trimmed, lowercased, NFC), with the
+   * address it has stored, or `null` to refuse. The link signs in only an
+   * account whose stored `email` is the link's address, compared trimmed
+   * and lowercased: a lookup that ignores accents or dots (MySQL's default
+   * collation does) would otherwise sign whoever reads `victim@exämple.com`
+   * in to `victim@example.com`'s account.
+   */
+  abstract resolveUser(email: string): MagicLinkAccount | null | Promise<MagicLinkAccount | null>;
 }

@@ -81,6 +81,7 @@ export type {
   JwtSignerOptions,
   JwtVerifierOptions,
   MagicLink,
+  MagicLinkAccount,
   MagicLinkOptions,
   MagicLinkRecord,
   MagicLinkRequest,

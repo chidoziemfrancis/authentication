@@ -60,6 +60,26 @@ class ViewerResolver {
 })
 class GqlAppModule {}
 
+describe('a GraphQL context object', () => {
+  it('fails at startup: one object for every request would authenticate each as the first caller', async () => {
+    @Module({
+      imports: [
+        authenticationModule(),
+        UsersModule,
+        AuthProvidersModule,
+        ApiKeysModule,
+        GraphQLModule.forRoot<ApolloDriverConfig>({ driver: ApolloDriver, typeDefs, context: { tenant: 'static' } }),
+      ],
+      providers: [ViewerResolver],
+    })
+    class StaticContextModule {}
+
+    await expect(createApp('express', StaticContextModule)).rejects.toThrow(
+      /^AuthenticationModule: the GraphQL module’s `context` is an object, shared by every request/,
+    );
+  });
+});
+
 describe('GraphQL (Apollo, express)', () => {
   let app: INestApplication;
   const gql = (query: string, key?: string) => {

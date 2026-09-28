@@ -22,8 +22,9 @@ export interface TotpRecord {
  * of guesses from outrunning the lockout, and must be single atomic writes
  * (a conditional update or delete, an upsert, a Lua script), never a read
  * followed by a write: `saveTotp()`, `claimTotpStep()`,
- * `consumeRecoveryCode()` and `recordMfaFailure()`. The README's
- * "Implementing a store" section has the races each one prevents.
+ * `consumeRecoveryCode()` and `recordMfaFailure()`. Each one's comment has
+ * the race it prevents, and `authenticationStoreContract()` from
+ * `@nestjs/authentication/testing` checks them (`concurrent: true`).
  *
  * Times (`now`) are epoch milliseconds from `MfaService`'s clock, never the
  * store's. Optional fields come back absent (`undefined`), never `null`.
