@@ -1,7 +1,8 @@
 /**
  * `AuthenticationGuard` over HTTP without a server: the provider chain, challenges, pending
  * second factors, `@Authenticate({ providers, verifiedEmail })`, the per-request cache; what it
- * leaves on a fake socket per message; the route decorators; `WsAuthenticator` on fake sockets;
+ * leaves on a fake socket per message, and per GraphQL operation on an upgrade request that
+ * operations share; the route decorators; `WsAuthenticator` on fake sockets;
  * `AuthenticationContext` on its own.
  */
 import { ForbiddenException, Logger, UnauthorizedException, type ExecutionContext } from '@nestjs/common';
@@ -366,6 +367,56 @@ describe('AuthenticationGuard over ws', () => {
   });
 });
 
+describe('AuthenticationGuard over graphql-ws', () => {
+  const USER_OF = Symbol.for('nestjs.authentication.userOf');
+  type Upgrade = Request & { [USER_OF]?: (context: ExecutionContext) => unknown };
+
+  /** An operation on a socket: its own context, around the upgrade request every operation of the socket shares. */
+  function operation(req: Upgrade) {
+    const gqlContext = { req };
+    return (method: keyof Routes) => {
+      const context = new ExecutionContextHost([{}, {}, gqlContext, {}], Routes, Routes.prototype[method]);
+      context.setType('graphql');
+      return context;
+    };
+  }
+
+  it("leaves on `req`, for other packages, each operation's own user: null for one that recorded nothing (@Public())", async () => {
+    const { guard } = setup();
+    const upgrade: Upgrade = { headers: { 'x-first': 'ok' } };
+    const signedIn = operation(upgrade)('required');
+    const open = operation(upgrade)('open');
+
+    await guard.canActivate(signedIn);
+    await guard.canActivate(open);
+
+    // The request's own copy is the last authenticated operation's, as a ws client's is.
+    expect(upgrade.user).toEqual({ id: 'first' });
+    expect(upgrade[USER_OF]!(open)).toBeNull();
+    expect(upgrade[USER_OF]!(signedIn)).toEqual({ id: 'first' });
+    // Not `undefined`, which would send a caller back to `req.user`: the request is not the operation's own.
+    expect(upgrade[USER_OF]!(operation(upgrade)('required'))).toBeNull();
+  });
+
+  it("shares one operation's result between its resolvers, a @Public() root field included, as over HTTP", async () => {
+    const { guard } = setup();
+    const upgrade: Upgrade = { headers: { 'x-first': 'ok' } };
+    const resolver = operation(upgrade);
+
+    await guard.canActivate(resolver('required'));
+    expect(upgrade[USER_OF]!(resolver('open'))).toEqual({ id: 'first' });
+  });
+
+  it('leaves no such function on an HTTP request, which is per call', async () => {
+    const { guard } = setup();
+    const { context, request } = http('required', { 'x-first': 'ok' });
+
+    await guard.canActivate(context);
+    expect(request.user).toEqual({ id: 'first' });
+    expect(USER_OF in request).toBe(false);
+  });
+});
+
 describe('route decorators', () => {
   const metadata = (target: object) => Reflect.getMetadata(AUTHENTICATION_METADATA, target);
 
@@ -431,6 +482,28 @@ describe('route decorators', () => {
       'first',
       { via: 'first' },
     ]);
+  });
+
+  it("@CurrentUser() and @CurrentSession() give a GraphQL operation its own result, not another's on a shared `req`", async () => {
+    const { guard } = setup();
+    const user = factoryOf(CurrentUser());
+    const session = factoryOf(CurrentSession());
+    const upgrade: Request = { headers: { 'x-first': 'ok' } };
+    const operation = (method: keyof Routes, gqlContext = { req: upgrade }) => {
+      const context = new ExecutionContextHost([{}, {}, gqlContext, {}], Routes, Routes.prototype[method]);
+      context.setType('graphql');
+      return context;
+    };
+
+    const signedIn = { req: upgrade };
+    await guard.canActivate(operation('required', signedIn));
+    const sameOperation = operation('required', signedIn);
+    expect([user(sameOperation), session(sameOperation)]).toEqual([{ id: 'first' }, { via: 'first' }]);
+
+    const open = operation('open');
+    await guard.canActivate(open);
+    expect(upgrade.user).toEqual({ id: 'first' }); // the socket's last user...
+    expect([user(open), session(open)]).toEqual([null, null]); // ...is not this operation's
   });
 });
 

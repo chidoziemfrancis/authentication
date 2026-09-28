@@ -6,8 +6,9 @@ const AUTH_STATE = Symbol.for('nestjs.authentication.state');
 /** The `session` this package last mirrored on a carrier, to tell it from another package's. */
 const MIRRORED_SESSION = Symbol.for('nestjs.authentication.mirrored-session');
 /**
- * Where a ws client carries {@link userOf}, for other packages to call without importing this
- * one (`@nestjs/authorization` does). A registry symbol, so every copy of either package agrees.
+ * Where a ws client, or GraphQL's `context.req`, carries {@link userOf}, for other packages to call
+ * without importing this one (`@nestjs/authorization` does). A registry symbol, so every copy of
+ * either package agrees.
  */
 const USER_OF = Symbol.for('nestjs.authentication.userOf');
 
@@ -15,12 +16,12 @@ type Headers = Record<string, string | string[] | undefined>;
 type State = AuthenticationResult<any, any> | null;
 
 /**
- * Per-call state. For HTTP, RPC and GraphQL the carrier below is already
- * per call. A WebSocket carrier is the socket, which outlives the message and
- * is shared by concurrent messages, so ws calls are also keyed by their
- * message payload (the same object reaches guards, interceptors and param
- * decorators) or, for primitive payloads, by the args array (shared by
- * guards and interceptors).
+ * Per-call state. For HTTP and RPC the carrier below is already per call, and
+ * a GraphQL operation keeps its own on its context ({@link stateCarrierOf}). A
+ * WebSocket carrier is the socket, which outlives the message and is shared
+ * by concurrent messages, so ws calls are also keyed by their message payload
+ * (the same object reaches guards, interceptors and param decorators) or, for
+ * primitive payloads, by the args array (shared by guards and interceptors).
  */
 const perCall = new WeakMap<object, State>();
 
@@ -41,7 +42,8 @@ function callKeys(context: ExecutionContext): object[] {
  * The object that carries the result for one call, mirrored as `user` /
  * `session` where Passport-era code and `@nestjs/authorization` look:
  * the request (http), the client socket (ws), the transport context (rpc),
- * `context.req` (graphql).
+ * `context.req` (graphql; over graphql-ws, the socket's upgrade request, which
+ * every operation of the socket shares).
  */
 function carrierOf(context: ExecutionContext): Record<PropertyKey, any> | undefined {
   switch (context.getType<string>()) {
@@ -72,19 +74,23 @@ export function setAuthState(context: ExecutionContext, result: State, { perCall
   }
 
   const carrier = carrierOf(context);
-  if (!carrier) {
-    return;
-  }
-
-  if (context.getType() === 'ws') {
-    // A function of the message, not a user: safe on the socket that concurrent messages share.
+  const type = context.getType<string>();
+  if (carrier && (type === 'ws' || type === 'graphql')) {
+    // A function of the call, not a user: safe on a carrier that other calls share.
     carrier[USER_OF] = userOf;
   }
   if (perCallOnly) {
     return;
   }
 
-  carrier[AUTH_STATE] = result;
+  const own = stateCarrierOf(context);
+  if (own) {
+    own[AUTH_STATE] = result;
+  }
+  if (!carrier) {
+    return;
+  }
+
   carrier.user = result?.user ?? null;
   // `request.session` is often another package's (express-session, @fastify/session): mirrored only
   // where it is free, or still holds what this package put there.
@@ -105,8 +111,8 @@ export function getAuthState(context: ExecutionContext): State | undefined {
     }
   }
 
-  const carrier = carrierOf(context);
-  return carrier && AUTH_STATE in carrier ? carrier[AUTH_STATE] : undefined;
+  const own = stateCarrierOf(context);
+  return own && AUTH_STATE in own ? own[AUTH_STATE] : undefined;
 }
 
 /**
@@ -120,16 +126,22 @@ export function resultOf(context: ExecutionContext): State | undefined {
 }
 
 /**
- * The user of one ws message, for other packages: they call `client[USER_OF](context)` on a
- * client this package has recorded a result on. The client is the connection, so its `user` is
- * whatever the last authenticated message left, and a `@Public()` message leaves it alone. This
- * answers what `@CurrentUser()` gets instead: the message's user, `null` when the message is
- * anonymous (a `@Public()` one is), and `undefined` when nothing was recorded, for the message
- * or its connection.
+ * The user of one ws message or GraphQL operation, for other packages: they call
+ * `carrier[USER_OF](context)` on a ws client, or on GraphQL's `context.req`, that this package
+ * has recorded a result on. Both outlive the call: the client is the connection, and over
+ * graphql-ws `context.req` is the socket's upgrade request. Their `user` is whatever the last
+ * authenticated call left, and a `@Public()` call leaves it alone. This answers what
+ * `@CurrentUser()` gets instead: the call's user, `null` when the call is anonymous (a `@Public()`
+ * one is), and `undefined` when nothing was recorded, for the message or its connection. A GraphQL
+ * operation records its own result, so one that recorded nothing authenticated nothing: `null`,
+ * never the `user` another operation left on the `req` they share.
  */
 function userOf(context: ExecutionContext): unknown {
   const result = resultOf(context);
-  return result === undefined ? undefined : (result?.user ?? null);
+  if (result === undefined) {
+    return context.getType<string>() === 'graphql' ? null : undefined;
+  }
+  return result?.user ?? null;
 }
 
 const RAW = Symbol.for('nestjs.authentication.raw');
@@ -150,9 +162,9 @@ export function setRawResult(context: ExecutionContext, result: State) {
     return;
   }
 
-  const carrier = rawCarrierOf(context);
-  if (carrier) {
-    carrier[RAW] = result;
+  const own = stateCarrierOf(context);
+  if (own) {
+    own[RAW] = result;
   }
 }
 
@@ -166,12 +178,17 @@ export function getRawResult(context: ExecutionContext): State | undefined {
     return undefined;
   }
 
-  const carrier = rawCarrierOf(context);
-  return carrier && RAW in carrier ? carrier[RAW] : undefined;
+  const own = stateCarrierOf(context);
+  return own && RAW in own ? own[RAW] : undefined;
 }
 
-/** Where the raw answer is cached: the GraphQL operation's context, else the call's carrier. */
-function rawCarrierOf(context: ExecutionContext): Record<PropertyKey, any> | undefined {
+/**
+ * Where a call's own state is kept, the providers' raw answer and the result
+ * recorded for the handler: the GraphQL operation's context, else the call's
+ * carrier. The context is built for each operation; its `req` is not, over
+ * graphql-ws.
+ */
+function stateCarrierOf(context: ExecutionContext): Record<PropertyKey, any> | undefined {
   if (context.getType<string>() === 'graphql') {
     const operation = context.getArgByIndex(2);
     return typeof operation === 'object' && operation !== null ? operation : undefined;
