@@ -154,10 +154,11 @@ export class AuthenticationGuard implements CanActivate {
   }
 
   /**
-   * A ws socket keeps its last user (`client.user`) for code that reads it,
-   * `@nestjs/authorization` among it, on messages that run no provider
-   * (`@Public()`): a message refused for its credentials says the connection
-   * has none now, its session revoked or its token expired.
+   * A ws socket keeps its last user (`client.user`) for code that reads it on
+   * messages that run no provider (`@Public()`): a message refused for its
+   * credentials says the connection has none now, its session revoked or its
+   * token expired. `@nestjs/authorization` asks for each message's own user
+   * instead (`userOf` in auth-state.util.ts).
    */
   private forgetConnection(context: ExecutionContext) {
     if (context.getType() === 'ws') {

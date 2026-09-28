@@ -1,7 +1,8 @@
 /**
  * `AuthenticationGuard` over HTTP without a server: the provider chain, challenges, pending
- * second factors, `@Authenticate({ providers, verifiedEmail })`, the per-request cache; the
- * route decorators; `WsAuthenticator` on fake sockets; `AuthenticationContext` on its own.
+ * second factors, `@Authenticate({ providers, verifiedEmail })`, the per-request cache; what it
+ * leaves on a fake socket per message; the route decorators; `WsAuthenticator` on fake sockets;
+ * `AuthenticationContext` on its own.
  */
 import { ForbiddenException, Logger, UnauthorizedException, type ExecutionContext } from '@nestjs/common';
 import { ROUTE_ARGS_METADATA } from '@nestjs/common/constants';
@@ -324,6 +325,44 @@ describe('AuthenticationGuard over HTTP', () => {
     expect(unverified.response).toEqual({}); // a 403 carries no challenge
 
     await expect(guard.canActivate(http('verified', { 'x-first': 'verified' }).context)).resolves.toBe(true);
+  });
+});
+
+describe('AuthenticationGuard over ws', () => {
+  const USER_OF = Symbol.for('nestjs.authentication.userOf');
+  type Socket = { request: Request; user?: unknown; [USER_OF]?: (context: ExecutionContext) => unknown };
+
+  /** One message on `client`, handled by `method`. */
+  function message(client: Socket, method: keyof Routes, data: unknown = {}) {
+    const context = new ExecutionContextHost([client, data], Routes, Routes.prototype[method]);
+    context.setType('ws');
+    return context;
+  }
+
+  it("leaves on the socket, for other packages, each message's own user: null for a @Public() one", async () => {
+    const { guard } = setup();
+    const client: Socket = { request: { headers: { 'x-first': 'ok' } } };
+    const signedIn = message(client, 'required');
+    const open = message(client, 'open', 'hi');
+
+    await guard.canActivate(signedIn);
+    await guard.canActivate(open);
+
+    // The socket's own copy is the last authenticated message's: a @Public() one leaves it alone.
+    expect(client.user).toEqual({ id: 'first' });
+    expect(client[USER_OF]!(open)).toBeNull();
+    expect(client[USER_OF]!(signedIn)).toEqual({ id: 'first' });
+  });
+
+  it('answers for a message the guard did not see with what its connection recorded, undefined before anything was', async () => {
+    const { guard } = setup();
+    const client: Socket = { request: { headers: { 'x-first': 'ok' } } };
+
+    await guard.canActivate(message(client, 'open'));
+    expect(client[USER_OF]!(message(client, 'required'))).toBeUndefined();
+
+    await guard.canActivate(message(client, 'required'));
+    expect(client[USER_OF]!(message(client, 'required'))).toEqual({ id: 'first' });
   });
 });
 

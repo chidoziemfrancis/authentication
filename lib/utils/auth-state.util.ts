@@ -1,9 +1,15 @@
 import type { ExecutionContext } from '@nestjs/common';
+import { scopedResult } from '../context/authentication-scope.service.js';
 import type { AuthenticationResult } from '../interfaces/authentication-result.interface.js';
 
 const AUTH_STATE = Symbol.for('nestjs.authentication.state');
 /** The `session` this package last mirrored on a carrier, to tell it from another package's. */
 const MIRRORED_SESSION = Symbol.for('nestjs.authentication.mirrored-session');
+/**
+ * Where a ws client carries {@link userOf}, for other packages to call without importing this
+ * one (`@nestjs/authorization` does). A registry symbol, so every copy of either package agrees.
+ */
+const USER_OF = Symbol.for('nestjs.authentication.userOf');
 
 type Headers = Record<string, string | string[] | undefined>;
 type State = AuthenticationResult<any, any> | null;
@@ -65,12 +71,16 @@ export function setAuthState(context: ExecutionContext, result: State, { perCall
     perCall.set(key, result);
   }
 
-  if (perCallOnly) {
+  const carrier = carrierOf(context);
+  if (!carrier) {
     return;
   }
 
-  const carrier = carrierOf(context);
-  if (!carrier) {
+  if (context.getType() === 'ws') {
+    // A function of the message, not a user: safe on the socket that concurrent messages share.
+    carrier[USER_OF] = userOf;
+  }
+  if (perCallOnly) {
     return;
   }
 
@@ -97,6 +107,29 @@ export function getAuthState(context: ExecutionContext): State | undefined {
 
   const carrier = carrierOf(context);
   return carrier && AUTH_STATE in carrier ? carrier[AUTH_STATE] : undefined;
+}
+
+/**
+ * @internal This call's result: the scope the interceptor opened for it, else what the guard
+ * recorded on the carrier. A ws message whose payload is a primitive shares nothing else with its
+ * guard but the socket, which outlives it, and would otherwise read another message's user.
+ */
+export function resultOf(context: ExecutionContext): State | undefined {
+  const scoped = scopedResult(context);
+  return scoped !== undefined ? scoped : getAuthState(context);
+}
+
+/**
+ * The user of one ws message, for other packages: they call `client[USER_OF](context)` on a
+ * client this package has recorded a result on. The client is the connection, so its `user` is
+ * whatever the last authenticated message left, and a `@Public()` message leaves it alone. This
+ * answers what `@CurrentUser()` gets instead: the message's user, `null` when the message is
+ * anonymous (a `@Public()` one is), and `undefined` when nothing was recorded, for the message
+ * or its connection.
+ */
+function userOf(context: ExecutionContext): unknown {
+  const result = resultOf(context);
+  return result === undefined ? undefined : (result?.user ?? null);
 }
 
 const RAW = Symbol.for('nestjs.authentication.raw');

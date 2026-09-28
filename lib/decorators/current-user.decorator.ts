@@ -1,6 +1,5 @@
 import { createParamDecorator, type ExecutionContext } from '@nestjs/common';
-import { getAuthState } from '../utils/auth-state.util.js';
-import { scopedResult } from '../context/authentication-scope.service.js';
+import { resultOf } from '../utils/auth-state.util.js';
 import type { AuthenticatedUser } from '../interfaces/authentication-result.interface.js';
 
 /**
@@ -14,13 +13,3 @@ export const CurrentUser = createParamDecorator<keyof AuthenticatedUser | undefi
     return key && user ? user[key] : user;
   },
 );
-
-/**
- * @internal This call's result: the scope the interceptor opened for it, else what the guard
- * recorded on the carrier. A ws message whose payload is a primitive shares nothing else with its
- * guard but the socket, which outlives it, and would otherwise read another message's user.
- */
-export function resultOf(context: ExecutionContext) {
-  const scoped = scopedResult(context);
-  return scoped !== undefined ? scoped : getAuthState(context);
-}

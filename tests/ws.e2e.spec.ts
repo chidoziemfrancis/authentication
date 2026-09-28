@@ -198,7 +198,7 @@ describe.each(adapters.map((a) => a.name))('WebSocket gateway on platform-ws (%s
 
     await request(app.getHttpServer()).post('/auth/logout').set('Cookie', cookie).expect(204);
     expect((await client.request('whoami', 'hi')).event).toBe('exception');
-    // What reads `client.user` (@nestjs/authorization on public messages) sees nobody now.
+    // Code that reads `client.user` on public messages sees nobody now.
     expect((await client.request('public-who', 'hi')).data).toEqual({ param: null, context: null, connection: null });
   });
 
