@@ -84,9 +84,6 @@ Before you submit your Pull Request (PR) consider the following guidelines:
      ```
 
 1. Create your patch, **including appropriate test cases**.
-1. Until @nestjs/authorization is published, build and pack ../authorization first
-  (`npm run build && npm pack` in a nestjs/authorization checkout next to this one); the
-  interop tests install it from `../authorization/nestjs-authorization-0.0.1.tgz`.
 1. Follow our [Coding Rules](#rules).
 1. Run the full Nest test suite, as described in the [developer documentation][dev-doc],
   and ensure that all tests pass.
