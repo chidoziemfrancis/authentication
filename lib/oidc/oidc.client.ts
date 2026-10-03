@@ -44,7 +44,7 @@ function assertSecureUrl(value: string | undefined, what: string): string {
  * PKCE (S256), `state` and `nonce`.
  *
  * Checks, in order: IdP error, `iss` response parameter (RFC 9207, mix-up
- * defence), token response shape, ID token signature (JWKS, RS256/ES256,
+ * defence), token response shape, ID token signature (JWKS, RS256/ES256 by default,
  * alg/key binding), `iss`, `aud`, `azp`, `exp`, `iat`, `nonce`, and that
  * userinfo's `sub` matches the ID token's (OIDC Core §5.3.2).
  */

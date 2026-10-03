@@ -1,4 +1,4 @@
-import { createHmac, createSecretKey, generateKeyPairSync, sign as cryptoSign, type KeyObject } from 'node:crypto';
+import { constants, createHmac, createSecretKey, generateKeyPairSync, sign as cryptoSign, type KeyObject } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { JwksClient, JwtError, JwtSigner, JwtVerifier, type JwsAlgorithm } from '../lib/index.js';
@@ -28,11 +28,19 @@ async function rejection(promise: Promise<unknown>): Promise<string> {
   throw new Error('expected a rejection');
 }
 
+// One key pair per curve: ES256 signs with P-256, ES384 with P-384, ES512 with P-521 (not "P-512").
 const keys = {
   rsa: generateKeyPairSync('rsa', { modulusLength: 2048 }),
   ec: generateKeyPairSync('ec', { namedCurve: 'P-256' }),
+  p384: generateKeyPairSync('ec', { namedCurve: 'P-384' }),
+  p521: generateKeyPairSync('ec', { namedCurve: 'P-521' }),
   ed: generateKeyPairSync('ed25519'),
 };
+
+// HMAC secrets must be at least as long as the hash's output (RFC 7518 §3.2): 48 bytes for
+// HS384, 64 for HS512. `SECRET` (43 bytes) is long enough for HS256 only.
+const SECRET_48 = 'test-secret-for-hs384-that-is-at-least-48-bytes!';
+const SECRET_64 = 'test-secret-for-hs512-that-must-be-at-least-sixty-four-bytes-long';
 
 describe('JwtVerifier: HS256', () => {
   const verifier = (options = {}) => new JwtVerifier({ key: SECRET, now: nowMs, ...options });
@@ -271,6 +279,141 @@ describe('JwtSigner + JwtVerifier: asymmetric', () => {
   });
 });
 
+/**
+ * The algorithms beyond the defaults. None of them is accepted unless a verifier lists it in
+ * `algorithms` (or, for ES384/ES512, is given a key of that curve), so they are opt-in, and
+ * each is bound to exactly one kind of key: the defence against key-confusion forgeries.
+ */
+describe('JwtSigner + JwtVerifier: RS384/512, PS256/384/512, ES384/512, HS384/512', () => {
+  // A public key verifies another party's tokens: pinned to their issuer, here with any audience.
+  const foreign = { issuer: 'i', audience: false } as const;
+  const header = (token: string) => JSON.parse(Buffer.from(token.split('.')[0], 'base64url').toString());
+  // The `header.payload` part of a token, for signing by hand: how the forged tokens below are made.
+  const input = (alg: string) => `${b64({ alg })}.${b64({ iss: 'i', exp: NOW + 10 })}`;
+
+  it.each<[JwsAlgorithm, { privateKey: KeyObject; publicKey: KeyObject }]>([
+    ['RS384', keys.rsa],
+    ['RS512', keys.rsa],
+    ['PS256', keys.rsa],
+    ['PS384', keys.rsa],
+    ['PS512', keys.rsa],
+    ['ES384', keys.p384],
+    ['ES512', keys.p521],
+  ])('%s round-trips when the verifier accepts it', async (alg, pair) => {
+    // The header names the algorithm the signer was given, and a verifier that lists it accepts the token.
+    const token = new JwtSigner({ key: pair.privateKey, alg, now: nowMs, issuer: 'i' }).sign({ sub: 'u1' });
+    expect(header(token).alg).toBe(alg);
+    const verifier = new JwtVerifier({ key: pair.publicKey, algorithms: [alg], now: nowMs, ...foreign });
+    await expect(verifier.verify(token)).resolves.toMatchObject({ sub: 'u1', iss: 'i' });
+  });
+
+  it.each<[JwsAlgorithm, string]>([
+    ['HS384', SECRET_48],
+    ['HS512', SECRET_64],
+  ])('%s round-trips with a secret as long as its hash', async (alg, secret) => {
+    const token = new JwtSigner({ key: secret, alg, now: nowMs }).sign({ sub: 'u1' });
+    expect(header(token).alg).toBe(alg);
+    await expect(new JwtVerifier({ key: secret, algorithms: [alg], now: nowMs }).verify(token)).resolves.toMatchObject({ sub: 'u1' });
+  });
+
+  it('takes ES384 and ES512 from the curve, but never PS or a longer hash from an RSA key', async () => {
+    // An EC key fits exactly one algorithm, so it can be implied. An RSA key fits six (RS and PS,
+    // three hashes each) and a secret three: they keep their old default, and the rest are opted into.
+    expect(header(new JwtSigner({ key: keys.p384.privateKey }).sign({})).alg).toBe('ES384');
+    expect(header(new JwtSigner({ key: keys.p521.privateKey }).sign({})).alg).toBe('ES512');
+    expect(header(new JwtSigner({ key: keys.rsa.privateKey }).sign({})).alg).toBe('RS256');
+    expect(header(new JwtSigner({ key: SECRET_64 }).sign({})).alg).toBe('HS256');
+
+    const p384 = new JwtVerifier({ key: keys.p384.publicKey, now: nowMs, ...foreign });
+    expect(p384.algorithms).toEqual(['ES384']);
+    await expect(p384.verify(new JwtSigner({ key: keys.p384.privateKey, now: nowMs, issuer: 'i' }).sign({}))).resolves.toBeTruthy();
+
+    // An RSA key's verifier accepts RS256 only until PS256 or a longer hash is opted into.
+    const ps256 = new JwtSigner({ key: keys.rsa.privateKey, alg: 'PS256', now: nowMs, issuer: 'i' }).sign({});
+    const rs512 = new JwtSigner({ key: keys.rsa.privateKey, alg: 'RS512', now: nowMs, issuer: 'i' }).sign({});
+    const rsa = new JwtVerifier({ key: keys.rsa.publicKey, now: nowMs, ...foreign });
+    expect(await rejection(rsa.verify(ps256))).toBe('unsupported algorithm');
+    expect(await rejection(rsa.verify(rs512))).toBe('unsupported algorithm');
+    // Likewise a secret's verifier and HS512.
+    const hs512 = new JwtSigner({ key: SECRET_64, alg: 'HS512', now: nowMs }).sign({});
+    expect(await rejection(new JwtVerifier({ key: SECRET_64, now: nowMs }).verify(hs512))).toBe('unsupported algorithm');
+  });
+
+  it('binds each algorithm to its key: no curve, size, family or RSA-PSS key confusion', () => {
+    // Every misconfiguration fails when the signer or verifier is created (a `TypeError`), never at
+    // the first request. Each curve serves its own algorithm only.
+    expect(() => new JwtSigner({ key: keys.ec.privateKey, alg: 'ES384' })).toThrow(/not a valid ES384 key; ES384 needs a P-384 key/);
+    expect(() => new JwtSigner({ key: keys.p384.privateKey, alg: 'ES512' })).toThrow(/not a valid ES512 key; ES512 needs a P-521 key/);
+    expect(() => new JwtSigner({ key: keys.p521.privateKey, alg: 'ES256' })).toThrow(/not a valid ES256 key/);
+    expect(() => new JwtVerifier({ key: keys.p384.publicKey, algorithms: ['ES256'], ...foreign })).toThrow(/not a valid ES256 key/);
+    // A curve no algorithm takes is named, not reported as if EC keys were unsupported.
+    const k256 = generateKeyPairSync('ec', { namedCurve: 'secp256k1' });
+    expect(() => new JwtSigner({ key: k256.privateKey })).toThrow('JwtSigner: EC keys on secp256k1 are not supported (use P-256, P-384 or P-521).');
+    expect(() => new JwtVerifier({ key: k256.publicKey, ...foreign })).toThrow('JwtVerifier: EC keys on secp256k1 are not supported');
+
+    // A secret at least as long as the hash's output.
+    expect(() => new JwtSigner({ key: SECRET, alg: 'HS384' })).toThrow(/HS384 needs a secret of at least 48 bytes/);
+    expect(() => new JwtSigner({ key: SECRET_48, alg: 'HS512' })).toThrow(/HS512 needs a secret of at least 64 bytes/);
+    expect(() => new JwtVerifier({ key: SECRET, algorithms: ['HS512'] })).toThrow(/not a valid HS512 key/);
+
+    // An RSA key never serves an HMAC algorithm, nor a secret an RSA one, whatever else is accepted:
+    // HMAC with a public key as the secret is the classic forgery (anyone has the public key).
+    expect(() => new JwtVerifier({ key: keys.rsa.publicKey, algorithms: ['PS256', 'HS512'], ...foreign })).toThrow(/not a valid HS512 key/);
+    expect(() => new JwtSigner({ key: SECRET_64, alg: 'PS256' })).toThrow(/not a valid PS256 key/);
+    expect(() => new JwtSigner({ key: keys.rsa.publicKey, alg: 'PS384' })).toThrow(/private key/);
+    expect(() => new JwtSigner({ key: generateKeyPairSync('rsa', { modulusLength: 1024 }).privateKey, alg: 'PS256' })).toThrow(
+      /at least 2048 bits/,
+    );
+
+    // Node's `rsa-pss` keys carry their own hash and salt restrictions: refused, not guessed at.
+    const restricted = generateKeyPairSync('rsa-pss', { modulusLength: 2048 });
+    expect(() => new JwtSigner({ key: restricted.privateKey })).toThrow(/rsa-pss keys are not supported/);
+    expect(() => new JwtSigner({ key: restricted.privateKey, alg: 'PS256' })).toThrow(/not a valid PS256 key/);
+  });
+
+  it('rejects PKCS#1 v1.5 and PSS signatures presented as each other, and other hashes or salt lengths', async () => {
+    // RS and PS share one RSA key but pad differently, so a verifier that accepts both must still check
+    // the padding the header names. The tokens are signed by hand, as JwtSigner only signs correctly.
+    const verifier = new JwtVerifier({ key: keys.rsa.publicKey, algorithms: ['RS256', 'PS256', 'PS384'], now: nowMs, ...foreign });
+    const token = (alg: string, sign: (data: Buffer) => Buffer) => `${input(alg)}.${sign(Buffer.from(input(alg))).toString('base64url')}`;
+    const pss = (saltLength: number) => ({ key: keys.rsa.privateKey, padding: constants.RSA_PKCS1_PSS_PADDING, saltLength });
+
+    // The control: a correct PS256 signature, SHA-256 with a 32-byte salt, verifies.
+    await expect(verifier.verify(token('PS256', (data) => cryptoSign('sha256', data, pss(32))))).resolves.toBeTruthy();
+    const forged = [
+      token('RS256', (data) => cryptoSign('sha256', data, pss(32))), // PSS presented as PKCS#1 v1.5
+      token('PS256', (data) => cryptoSign('sha256', data, keys.rsa.privateKey)), // and the reverse
+      token('PS384', (data) => cryptoSign('sha256', data, pss(32))), // another hash than its alg names
+      token('PS256', (data) => cryptoSign('sha256', data, pss(20))), // a salt shorter than the hash (RFC 7518 §3.5)
+      token('PS256', (data) => cryptoSign('sha256', data, pss(64))), // or longer
+    ];
+    for (const bad of forged) {
+      expect(await rejection(verifier.verify(bad))).toBe('invalid signature');
+    }
+  });
+
+  it('takes raw r||s ECDSA signatures of the curve’s exact length only', async () => {
+    // JWS signatures are r and s side by side, each the curve's size (RFC 7518 §3.4). Any other length
+    // is refused as an invalid signature (a 401), never passed on to the crypto library to fail with a 500.
+    const cases: [JwsAlgorithm, KeyObject, string, number[]][] = [
+      ['ES384', keys.p384.publicKey, 'sha384', [64, 95, 97, 104]],
+      // P-521 coordinates are 66 bytes: 132, not the 128 the name suggests.
+      ['ES512', keys.p521.publicKey, 'sha512', [128, 131, 133, 139]],
+    ];
+    for (const [alg, publicKey, hash, lengths] of cases) {
+      const verifier = new JwtVerifier({ key: publicKey, algorithms: [alg], now: nowMs, ...foreign });
+      for (const bytes of lengths) {
+        expect(await rejection(verifier.verify(`${input(alg)}.${Buffer.alloc(bytes, 7).toString('base64url')}`))).toBe('invalid signature');
+      }
+
+      // A DER signature by the right key is refused too: JWS needs the raw form.
+      const privateKey = alg === 'ES384' ? keys.p384.privateKey : keys.p521.privateKey;
+      const der = cryptoSign(hash, Buffer.from(input(alg)), privateKey).toString('base64url');
+      expect(await rejection(verifier.verify(`${input(alg)}.${der}`))).toBe('invalid signature');
+    }
+  });
+});
+
 describe('JwksClient', () => {
   let server: Server;
   let uri: string;
@@ -381,14 +524,14 @@ describe('JwksClient', () => {
   it('ignores keys it cannot verify with: symmetric, other curves, `key_ops` without verify, unreadable', async () => {
     published = [
       { kty: 'oct', k: Buffer.from(SECRET).toString('base64url'), kid: 'oct' },
-      jwk(generateKeyPairSync('ec', { namedCurve: 'P-384' }).publicKey, 'p384'),
+      jwk(generateKeyPairSync('ec', { namedCurve: 'secp256k1' }).publicKey, 'k256'),
       jwk(keys.rsa.publicKey, 'ops', { key_ops: ['encrypt'] }),
       { kty: 'RSA', kid: 'broken' },
     ];
     const client = new JwksClient(uri);
     const verifier = new JwtVerifier({ jwks: client, ...idp, now: nowMs });
 
-    for (const kid of ['p384', 'ops', 'broken']) {
+    for (const kid of ['k256', 'ops', 'broken']) {
       expect(await rejection(verifier.verify(sign('RS256', keys.rsa.privateKey, kid)))).toBe('no matching key');
     }
     // A shared secret published in the set is no key at all, and HS256 is no JWKS algorithm.
@@ -510,5 +653,55 @@ describe('JwksClient', () => {
 
     const withEd = new JwtVerifier({ jwks: new JwksClient(uri), algorithms: ['EdDSA'], ...idp, now: nowMs });
     await expect(withEd.verify(token)).resolves.toBeTruthy();
+  });
+
+  it('verifies RS384/512, PS256/384/512, ES384 and ES512 only when enabled, with the key each one fits', async () => {
+    // An identity provider's set: an RSA key with no `alg` (so it may serve RS or PS), a P-384 key
+    // published for ES384, and a P-521 key.
+    published = [
+      jwk(keys.rsa.publicKey, 'rsa-1'),
+      jwk(keys.p384.publicKey, 'p384-1', { alg: 'ES384' }),
+      jwk(keys.p521.publicKey, 'p521-1'),
+    ];
+    const tokens = {
+      PS256: sign('PS256', keys.rsa.privateKey, 'rsa-1'),
+      RS512: sign('RS512', keys.rsa.privateKey, 'rsa-1'),
+      ES384: sign('ES384', keys.p384.privateKey, 'p384-1'),
+      ES512: sign('ES512', keys.p521.privateKey, 'p521-1'),
+    };
+
+    // The default allowlist (RS256, ES256) refuses them all before any key is looked up.
+    const defaults = new JwtVerifier({ jwks: new JwksClient(uri), ...idp, now: nowMs });
+    for (const token of Object.values(tokens)) {
+      expect(await rejection(defaults.verify(token))).toBe('unsupported algorithm');
+    }
+
+    // Opted into, each verifies with the key of the set that fits it.
+    const algorithms: JwsAlgorithm[] = ['PS256', 'RS512', 'ES384', 'ES512'];
+    const enabled = new JwtVerifier({ jwks: new JwksClient(uri), algorithms, ...idp, now: nowMs });
+    for (const token of Object.values(tokens)) {
+      await expect(enabled.verify(token)).resolves.toMatchObject({ sub: 'u1' });
+    }
+    // Kid-less too: one key of the set fits each curve.
+    await expect(enabled.verify(sign('ES512', keys.p521.privateKey))).resolves.toMatchObject({ sub: 'u1' });
+
+    // A token never picks a key of another curve, whatever its kid says.
+    expect(await rejection(enabled.verify(sign('ES512', keys.p521.privateKey, 'p384-1')))).toBe('no matching key');
+  });
+
+  it('keeps a JWK published as RS256 from verifying PS256, and HMAC algorithms from a JWKS', async () => {
+    // A JWK's `alg` is the identity provider saying what the key is for: it narrows the RS and PS
+    // algorithms an RSA key could otherwise serve, even when the verifier accepts them all.
+    published = [jwk(keys.rsa.publicKey, 'rsa-1', { alg: 'RS256' })];
+    const verifier = new JwtVerifier({ jwks: new JwksClient(uri), algorithms: ['RS256', 'PS256'], ...idp, now: nowMs });
+    expect(await rejection(verifier.verify(sign('PS256', keys.rsa.privateKey, 'rsa-1')))).toBe('no matching key');
+    await expect(verifier.verify(sign('RS256', keys.rsa.privateKey, 'rsa-1'))).resolves.toMatchObject({ sub: 'u1' });
+
+    // A JWKS holds public keys, and an HMAC "secret" anyone can download is no secret: refused both
+    // when the verifier is created and by the client itself.
+    for (const alg of ['HS384', 'HS512'] as const) {
+      expect(() => new JwtVerifier({ jwks: uri, algorithms: ['RS256', alg], ...idp })).toThrow(`JwtVerifier: ${alg} cannot be combined with a JWKS.`);
+      expect(await rejection(new JwksClient(uri).getKey({ alg, kid: 'rsa-1' }))).toBe('unsupported algorithm');
+    }
   });
 });

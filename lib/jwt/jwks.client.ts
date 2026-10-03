@@ -14,12 +14,20 @@ interface CachedKey {
 
 const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]']);
 
+/** The algorithm of each curve a JWK can name (`crv`, RFC 7518 §6.2.1.1). Other curves are skipped. */
+const EC_ALGORITHMS: Record<string, JwsAlgorithm> = { 'P-256': 'ES256', 'P-384': 'ES384', 'P-521': 'ES512' };
+
+/**
+ * What a JWK can verify, by its type and curve. An RSA key serves every RS and
+ * PS algorithm: its `alg`, when published, narrows that, and the verifier's
+ * `algorithms` decide which of them are accepted at all.
+ */
 function algorithmsFor(jwk: JsonWebKey): JwsAlgorithm[] {
   if (jwk.kty === 'RSA') {
-    return ['RS256'];
+    return ['RS256', 'RS384', 'RS512', 'PS256', 'PS384', 'PS512'];
   }
-  if (jwk.kty === 'EC' && jwk.crv === 'P-256') {
-    return ['ES256'];
+  if (jwk.kty === 'EC' && jwk.crv && EC_ALGORITHMS[jwk.crv]) {
+    return [EC_ALGORITHMS[jwk.crv]];
   }
   if (jwk.kty === 'OKP' && jwk.crv === 'Ed25519') {
     return ['EdDSA'];

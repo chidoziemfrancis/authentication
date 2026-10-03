@@ -1,6 +1,7 @@
 import {
   KeyObject,
   X509Certificate,
+  constants,
   createHmac,
   createPrivateKey,
   createPublicKey,
@@ -13,7 +14,32 @@ import { toMs } from '../utils/duration.util.js';
 import type { JwsAlgorithm, JwtClaims, ClaimRules } from '../interfaces/jwt.interface.js';
 import { JwtError } from '../errors/jwt.error.js';
 
-export const ASYMMETRIC_ALGORITHMS: readonly JwsAlgorithm[] = ['RS256', 'ES256', 'EdDSA'];
+/** The algorithms a public key verifies: the only ones a JWKS can serve (HS secrets are never published). */
+export const ASYMMETRIC_ALGORITHMS: readonly JwsAlgorithm[] = [
+  'RS256',
+  'RS384',
+  'RS512',
+  'PS256',
+  'PS384',
+  'PS512',
+  'ES256',
+  'ES384',
+  'ES512',
+  'EdDSA',
+];
+
+type HashedAlgorithm = Exclude<JwsAlgorithm, 'EdDSA'>;
+
+/** `HS384` → `sha384`: the digest every algorithm but EdDSA names in its last three digits. */
+const hashOf = (alg: HashedAlgorithm) => `sha${alg.slice(2)}` as 'sha256' | 'sha384' | 'sha512';
+
+/** The curve each ECDSA algorithm is bound to (RFC 7518 §3.4), by its OpenSSL name. */
+const CURVES = { ES256: 'prime256v1', ES384: 'secp384r1', ES512: 'secp521r1' } as const;
+/** The reverse: the one algorithm an EC key of each curve implies. Other curves (secp256k1, …) imply none. */
+const CURVE_ALGORITHMS: Record<string, JwsAlgorithm> = { prime256v1: 'ES256', secp384r1: 'ES384', secp521r1: 'ES512' };
+
+/** Raw r||s length: twice the curve's coordinate size (P-521's is 66 bytes, not 64). */
+const ECDSA_SIGNATURE_BYTES = { ES256: 64, ES384: 96, ES512: 132 } as const;
 
 export interface JwsHeader {
   alg: string;
@@ -68,7 +94,11 @@ export function toKeyObject(key: KeyObject | string | Buffer): KeyObject {
   }
 }
 
-/** The algorithm a key implies: HS256 for a secret, the key's own for asymmetric keys. */
+/**
+ * The algorithm a key implies: HS256 for a secret, RS256 for an RSA key (the
+ * key does not name a hash or padding: PS and the longer hashes are opted
+ * into with `alg`), and the curve's own for an EC key.
+ */
 export function algorithmFor(key: KeyObject): JwsAlgorithm | undefined {
   if (key.type === 'secret') {
     return 'HS256';
@@ -77,12 +107,22 @@ export function algorithmFor(key: KeyObject): JwsAlgorithm | undefined {
     case 'rsa':
       return 'RS256';
     case 'ec':
-      return 'ES256';
+      return CURVE_ALGORITHMS[key.asymmetricKeyDetails?.namedCurve ?? ''];
     case 'ed25519':
       return 'EdDSA';
     default:
       return undefined;
   }
+}
+
+/** The configuration error for a key no algorithm fits: an EC key names its curve, as EC keys of other curves are. */
+export function unsupportedKeyError(key: KeyObject, owner: string): TypeError {
+  const curve = key.asymmetricKeyType === 'ec' ? key.asymmetricKeyDetails?.namedCurve : undefined;
+  return new TypeError(
+    curve
+      ? `${owner}: EC keys on ${curve} are not supported (use P-256, P-384 or P-521).`
+      : `${owner}: ${key.asymmetricKeyType} keys are not supported.`,
+  );
 }
 
 /**
@@ -93,12 +133,28 @@ export function algorithmFor(key: KeyObject): JwsAlgorithm | undefined {
 export function keyFits(alg: JwsAlgorithm, key: KeyObject): boolean {
   const details = key.asymmetricKeyDetails;
   switch (alg) {
+    // A secret at least as long as the hash's output (RFC 7518 §3.2).
     case 'HS256':
       return key.type === 'secret' && (key.symmetricKeySize ?? 0) >= 32;
+    case 'HS384':
+      return key.type === 'secret' && (key.symmetricKeySize ?? 0) >= 48;
+    case 'HS512':
+      return key.type === 'secret' && (key.symmetricKeySize ?? 0) >= 64;
+    // One RSA key serves both paddings and every hash: the header names which, and the verifier's
+    // `algorithms` decide which are accepted. Node's `rsa-pss` keys are refused (asymmetricKeyType
+    // 'rsa-pss'): they restrict their own hash and salt, which a JWKS cannot even publish.
     case 'RS256':
+    case 'RS384':
+    case 'RS512':
+    case 'PS256':
+    case 'PS384':
+    case 'PS512':
       return key.asymmetricKeyType === 'rsa' && (details?.modulusLength ?? 0) >= 2048;
+    // Each ECDSA algorithm takes its own curve only: an ES256 token never verifies with a P-384 key.
     case 'ES256':
-      return key.asymmetricKeyType === 'ec' && details?.namedCurve === 'prime256v1';
+    case 'ES384':
+    case 'ES512':
+      return key.asymmetricKeyType === 'ec' && details?.namedCurve === CURVES[alg];
     case 'EdDSA':
       return key.asymmetricKeyType === 'ed25519';
     default:
@@ -106,12 +162,26 @@ export function keyFits(alg: JwsAlgorithm, key: KeyObject): boolean {
   }
 }
 
+/** What each algorithm needs, for the configuration error that names it. */
+const RSA_KEY = 'an RSA key of at least 2048 bits';
 const REQUIREMENTS: Record<JwsAlgorithm, string> = {
   HS256: 'a secret of at least 32 bytes (`openssl rand -base64 32`)',
-  RS256: 'an RSA key of at least 2048 bits',
+  HS384: 'a secret of at least 48 bytes (`openssl rand -base64 48`)',
+  HS512: 'a secret of at least 64 bytes (`openssl rand -base64 64`)',
+  RS256: RSA_KEY,
+  RS384: RSA_KEY,
+  RS512: RSA_KEY,
+  PS256: RSA_KEY,
+  PS384: RSA_KEY,
+  PS512: RSA_KEY,
   ES256: 'a P-256 key',
+  ES384: 'a P-384 key',
+  ES512: 'a P-521 key',
   EdDSA: 'an Ed25519 key',
 };
+
+/** HS256, HS384, HS512: signed and verified with the same secret, so no private key is involved. */
+export const isHmac = (alg: JwsAlgorithm) => alg.startsWith('HS');
 
 /** Throws a `TypeError` (configuration, not a token) unless `key` can serve `alg`. */
 export function assertKeyFits(alg: JwsAlgorithm, key: KeyObject, owner: string): void {
@@ -123,7 +193,7 @@ export function assertKeyFits(alg: JwsAlgorithm, key: KeyObject, owner: string):
 /** Throws a `TypeError` (configuration, not a token) unless `key` can sign `alg`. */
 export function assertSigningKey(alg: JwsAlgorithm, key: KeyObject, owner: string): void {
   assertKeyFits(alg, key, owner);
-  if (alg !== 'HS256' && key.type !== 'private') {
+  if (!isHmac(alg) && key.type !== 'private') {
     throw new TypeError(`${owner}: ${alg} signing needs a private key.`);
   }
 }
@@ -133,16 +203,28 @@ export function signJws(header: JwsHeader & { alg: JwsAlgorithm }, payload: obje
 
   const input = `${encode(header)}.${encode(payload)}`;
   const data = Buffer.from(input);
+  const { alg } = header;
   let signature: Buffer;
-  switch (header.alg) {
+  switch (alg) {
     case 'HS256':
-      signature = createHmac('sha256', key).update(data).digest();
+    case 'HS384':
+    case 'HS512':
+      signature = createHmac(hashOf(alg), key).update(data).digest();
       break;
     case 'RS256':
-      signature = cryptoSign('sha256', data, key);
+    case 'RS384':
+    case 'RS512':
+      signature = cryptoSign(hashOf(alg), data, key); // PKCS#1 v1.5 padding, Node's default for RSA
+      break;
+    case 'PS256':
+    case 'PS384':
+    case 'PS512':
+      signature = cryptoSign(hashOf(alg), data, pss(key));
       break;
     case 'ES256':
-      signature = cryptoSign('sha256', data, { key, dsaEncoding: 'ieee-p1363' });
+    case 'ES384':
+    case 'ES512':
+      signature = cryptoSign(hashOf(alg), data, { key, dsaEncoding: 'ieee-p1363' });
       break;
     case 'EdDSA':
       signature = cryptoSign(null, data, key);
@@ -195,19 +277,31 @@ export function verifySignature(alg: JwsAlgorithm, key: KeyObject, decoded: Deco
   const { signingInput, signature } = decoded;
   let valid: boolean;
   switch (alg) {
-    case 'HS256': {
-      const expected = createHmac('sha256', publicKey).update(signingInput).digest();
+    case 'HS256':
+    case 'HS384':
+    case 'HS512': {
+      const expected = createHmac(hashOf(alg), publicKey).update(signingInput).digest();
       valid = signature.length === expected.length && timingSafeEqual(signature, expected);
       break;
     }
     case 'RS256':
-      valid = cryptoVerify('sha256', signingInput, publicKey, signature);
+    case 'RS384':
+    case 'RS512':
+      valid = cryptoVerify(hashOf(alg), signingInput, publicKey, signature);
+      break;
+    // Same key as RS, other padding: a PKCS#1 v1.5 signature presented as PS (or the reverse) fails here.
+    case 'PS256':
+    case 'PS384':
+    case 'PS512':
+      valid = cryptoVerify(hashOf(alg), signingInput, pss(publicKey), signature);
       break;
     case 'ES256':
+    case 'ES384':
+    case 'ES512':
       // JWS uses the raw r||s form (RFC 7518 §3.4), not DER.
       valid =
-        signature.length === 64 &&
-        cryptoVerify('sha256', signingInput, { key: publicKey, dsaEncoding: 'ieee-p1363' }, signature);
+        signature.length === ECDSA_SIGNATURE_BYTES[alg] &&
+        cryptoVerify(hashOf(alg), signingInput, { key: publicKey, dsaEncoding: 'ieee-p1363' }, signature);
       break;
     case 'EdDSA':
       valid = signature.length === 64 && cryptoVerify(null, signingInput, publicKey, signature);
@@ -219,6 +313,15 @@ export function verifySignature(alg: JwsAlgorithm, key: KeyObject, decoded: Deco
   if (!valid) {
     throw new JwtError('invalid signature');
   }
+}
+
+/**
+ * RSASSA-PSS options (RFC 7518 §3.5): MGF1 on the same hash (Node's default),
+ * and a salt exactly as long as the hash. Verifying with this exact length,
+ * not "any", refuses signatures made with another salt length.
+ */
+function pss(key: KeyObject) {
+  return { key, padding: constants.RSA_PKCS1_PSS_PADDING, saltLength: constants.RSA_PSS_SALTLEN_DIGEST };
 }
 
 export function validateClaims(claims: JwtClaims, rules: ClaimRules): void {

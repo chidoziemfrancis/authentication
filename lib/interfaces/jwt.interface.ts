@@ -1,10 +1,24 @@
 import type { Duration } from './duration.interface.js';
 
 /**
- * Supported JWS algorithms. EdDSA means Ed25519 only: Ed448 is rejected
- * (untested here, and rare in practice).
+ * Supported JWS algorithms (RFC 7518 §3.1). EdDSA means Ed25519 only: Ed448
+ * is rejected (untested here, and rare in practice). PS256/384/512 take an
+ * RSA key, as a JWKS publishes it; Node's `rsa-pss` key type is rejected.
  */
-export type JwsAlgorithm = 'HS256' | 'RS256' | 'ES256' | 'EdDSA';
+export type JwsAlgorithm =
+  | 'HS256'
+  | 'HS384'
+  | 'HS512'
+  | 'RS256'
+  | 'RS384'
+  | 'RS512'
+  | 'PS256'
+  | 'PS384'
+  | 'PS512'
+  | 'ES256'
+  | 'ES384'
+  | 'ES512'
+  | 'EdDSA';
 
 export interface JwtClaims {
   iss?: string;

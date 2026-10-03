@@ -21,7 +21,7 @@ export interface JwksClientOptions {
 
 export interface JwtVerifierOptions extends ClaimRules {
   /**
-   * A static key: an HS256 secret (at least 32 bytes), or a public or
+   * A static key: an HMAC secret (at least 32 bytes for HS256), or a public or
    * private key as a `KeyObject` or PEM text (a string or a `Buffer`). A
    * public key needs `issuer` and `audience`, as a `jwks` does: it is an
    * identity provider's, which signs the tokens of all its clients with it.
@@ -36,9 +36,11 @@ export interface JwtVerifierOptions extends ClaimRules {
    */
   jwks?: string | JwksClient;
   /**
-   * Accepted `alg` values. Defaults: `['HS256']` for a secret, the key's own
-   * algorithm for an asymmetric key, `['RS256', 'ES256']` for a JWKS.
-   * `none` is never accepted.
+   * Accepted `alg` values. Defaults: `['HS256']` for a secret, `['RS256']`
+   * for an RSA key, the curve's own (`ES256`, `ES384`, `ES512`) for an EC
+   * key, `['EdDSA']` for an Ed25519 key, and `['RS256', 'ES256']` for a JWKS.
+   * Others (`RS384`, `PS256`, `HS512`, …) are opted into here. `none` is
+   * never accepted, and HS algorithms never with a JWKS.
    */
   algorithms?: JwsAlgorithm[];
   /** Required `typ` header, e.g. `at+jwt` (RFC 9068). Not checked by default. */
@@ -47,12 +49,16 @@ export interface JwtVerifierOptions extends ClaimRules {
 
 export interface JwtSignerOptions {
   /**
-   * An HS256 secret (at least 32 bytes), or a private key for RS256, ES256
-   * or EdDSA: a `KeyObject`, or PEM text (a string or a `Buffer`). A JWK, or
+   * An HMAC secret (at least as long as the hash: 32, 48 or 64 bytes), or an
+   * RSA, P-256, P-384, P-521 or Ed25519 private key: a `KeyObject`, or PEM
+   * text (a string or a `Buffer`). A JWK, or
    * DER, is refused: pass `createPrivateKey({ key: jwk, format: 'jwk' })`.
    */
   key: KeyObject | string | Buffer;
-  /** Default: HS256 for a secret, the key's own algorithm for a private key. */
+  /**
+   * Default: HS256 for a secret, RS256 for an RSA key, the curve's own for
+   * an EC key, EdDSA for an Ed25519 key.
+   */
   alg?: JwsAlgorithm;
   /** Published in the header so verifiers can pick the key from a JWKS. */
   kid?: string;

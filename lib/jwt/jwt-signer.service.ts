@@ -4,7 +4,7 @@ import { durationOr, toMs } from '../utils/duration.util.js';
 import type { Duration } from '../interfaces/duration.interface.js';
 import type { JwsAlgorithm, JwtClaims } from '../interfaces/jwt.interface.js';
 import type { JwtSignerOptions } from '../interfaces/jwt-options.interface.js';
-import { algorithmFor, assertSigningKey, signJws, toKeyObject } from './jws.util.js';
+import { algorithmFor, assertSigningKey, signJws, toKeyObject, unsupportedKeyError } from './jws.util.js';
 
 /**
  * Issues signed JWTs. Adds `iat`, `exp`, `jti` and the configured
@@ -21,7 +21,7 @@ export class JwtSigner {
     this.key = toKeyObject(options.key);
     const alg = options.alg ?? algorithmFor(this.key);
     if (!alg) {
-      throw new TypeError(`JwtSigner: ${this.key.asymmetricKeyType} keys are not supported.`);
+      throw unsupportedKeyError(this.key, 'JwtSigner');
     }
 
     assertSigningKey(alg, this.key, 'JwtSigner');
