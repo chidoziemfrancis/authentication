@@ -1,6 +1,6 @@
-# Contributing to Nest
+# Contributing to @nestjs/authentication
 
-We would love for you to contribute to Nest and help make it even better than it is
+We would love for you to contribute to `@nestjs/authentication` and help make it even better than it is
 today! As a contributor, here are the guidelines we would like you to follow:
 
  - [Code of Conduct](#coc)
@@ -8,6 +8,7 @@ today! As a contributor, here are the guidelines we would like you to follow:
  - [Issues and Bugs](#issue)
  - [Feature Requests](#feature)
  - [Submission Guidelines](#submit)
+ - [Development Setup](#development)
  - [Coding Rules](#rules)
  - [Commit Message Guidelines](#commit)
  <!-- - [Signing the CLA](#cla) -->
@@ -66,17 +67,17 @@ A minimal reproduce scenario using a repository or Gist allows us to quickly con
 
 Unfortunately, we are not able to investigate / fix bugs without a minimal reproduction, so if we don't hear back from you we are going to close an issue that don't have enough info to be reproduced.
 
-You can file new issues by filling out our [new issue form](https://github.com/nestjs/nest/issues/new).
+You can file new issues by filling out our [new issue form](https://github.com/nestjs/authentication/issues/new/choose).
 
 
 ### <a name="submit-pr"></a> Submitting a Pull Request (PR)
 Before you submit your Pull Request (PR) consider the following guidelines:
 
-1. Search [GitHub](https://github.com/nestjs/nest/pulls) for an open or closed PR
+1. Search [GitHub](https://github.com/nestjs/authentication/pulls) for an open or closed PR
   that relates to your submission. You don't want to duplicate effort.
 <!-- 1. Please sign our [Contributor License Agreement (CLA)](#cla) before sending PRs.
   We cannot accept code without this. -->
-1. Fork the nestjs/nest repo.
+1. Fork the nestjs/authentication repo.
 1. Make your changes in a new git branch:
 
      ```shell
@@ -85,8 +86,8 @@ Before you submit your Pull Request (PR) consider the following guidelines:
 
 1. Create your patch, **including appropriate test cases**.
 1. Follow our [Coding Rules](#rules).
-1. Run the full Nest test suite, as described in the [developer documentation][dev-doc],
-  and ensure that all tests pass.
+1. Run the build, the linter and the full test suite, as described in [Development Setup](#development),
+  and ensure that they all pass.
 1. Commit your changes using a descriptive commit message that follows our
   [commit message conventions](#commit). Adherence to these conventions
   is necessary because release notes are automatically generated from these messages.
@@ -105,7 +106,7 @@ Before you submit your Pull Request (PR) consider the following guidelines:
 1. In GitHub, send a pull request to `nestjs:master`.
 * If we suggest changes then:
   * Make the required updates.
-  * Re-run the Nest test suites to ensure tests are still passing.
+  * Re-run the test suite to ensure tests are still passing.
   * Rebase your branch and force push to your GitHub repository (this will update your Pull Request):
 
     ```shell
@@ -144,6 +145,31 @@ from the main (upstream) repository:
     git pull --ff upstream master
     ```
 
+## <a name="development"></a> Development Setup
+
+You need Node.js 22.12 or newer. To run the suites that use a database, you also need PostgreSQL.
+
+```shell
+npm install
+npm run build      # compile lib/ to dist/
+npm run lint       # oxlint
+npm run test:e2e   # every spec under tests/ (vitest); use test:e2e:dev to watch
+```
+
+The database specs get PostgreSQL in one of two ways:
+
+* With `SQL_TEST_PG_URL` set (for example `postgres://postgres:postgres@127.0.0.1:55432/postgres`,
+  as in CI), they create throwaway databases on that server and drop them afterwards.
+* Otherwise they start a temporary cluster from the locally installed `initdb`/`pg_ctl` (found in
+  `SQL_TEST_PG_BIN`, `/usr/local/bin`, or `PATH`). If neither is available, those suites are
+  skipped with the reason, and the rest still run.
+
+CI also type-checks the specs (`npx tsc -p tsconfig.json --noEmit`) and runs the suite against
+both the oldest supported NestJS release (12.0) and the latest 12.x.
+
+Husky hooks run `lint-staged` before each commit and `commitlint` on the message, so a commit that
+does not follow the [commit message conventions](#commit) is rejected.
+
 ## <a name="rules"></a> Coding Rules
 To ensure consistency throughout the source code, keep these rules in mind as you are working:
 
@@ -152,8 +178,7 @@ To ensure consistency throughout the source code, keep these rules in mind as yo
 // We're working on auto-documentation.
 * All public API methods **must be documented**. (Details TBC). -->
 * We follow [Google's JavaScript Style Guide][js-style-guide], but wrap all code at
-  **100 characters**. An automated formatter is available, see
-  [DEVELOPER.md](docs/DEVELOPER.md#clang-format).
+  **100 characters**. Format your changes with `npm run format` (Prettier).
 
 ## <a name="commit"></a> Commit Message Guidelines
 
@@ -180,15 +205,15 @@ to read on GitHub as well as in various git tools.
 
 Footer should contain a [closing reference to an issue](https://help.github.com/articles/closing-issues-via-commit-messages/) if any.
 
-Samples: (even more [samples](https://github.com/nestjs/nest/commits/master))
+Samples: (even more [samples](https://github.com/nestjs/authentication/commits/master))
 
 ```
-docs(changelog) update change log to beta.5
+docs(changelog): update change log to beta.5
 ```
 ```
-fix(@nestjs/core) need to depend on latest rxjs and zone.js
+fix(mfa): reject a TOTP step that was already used
 
-The version in our package.json gets copied to the one we publish, and users need the latest of these.
+A code accepted once must not be accepted again within the same time step.
 ```
 
 ### Revert
@@ -242,8 +267,7 @@ changes to be accepted, the CLA must be signed. It's a quick process, we promise
 <!-- [coc]: https://github.com/angular/code-of-conduct/blob/master/CODE_OF_CONDUCT.md -->
 [commit-message-format]: https://docs.google.com/document/d/1QrDFcIiPjSLDn3EL15IJygNPiHORgU1_OOAqWjiDU5Y/edit#
 [corporate-cla]: http://code.google.com/legal/corporate-cla-v1.0.html
-[dev-doc]: https://github.com/nestjs/nest/blob/master/docs/DEVELOPER.md
-[github]: https://github.com/nestjs/nest
+[github]: https://github.com/nestjs/authentication
 [discord]: https://discordapp.com/invite/G7Qnnhy
 [individual-cla]: http://code.google.com/legal/individual-cla-v1.0.html
 [js-style-guide]: https://google.github.io/styleguide/jsguide.html

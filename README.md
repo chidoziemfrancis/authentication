@@ -2,11 +2,6 @@
   <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
 </p>
 
-[travis-image]: https://api.travis-ci.org/nestjs/nest.svg?branch=master
-[travis-url]: https://travis-ci.org/nestjs/nest
-[linux-image]: https://img.shields.io/travis/nestjs/nest/master.svg?label=linux
-[linux-url]: https://travis-ci.org/nestjs/nest
-
   <p align="center">A progressive <a href="http://nodejs.org" target="blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
     <p align="center">
 <a href="https://www.npmjs.com/~nestjscore"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
@@ -33,7 +28,64 @@ $ npm i --save @nestjs/authentication
 
 ## Quick Start
 
-[Overview & Tutorial](https://docs.nestjs.com/security/authentication)
+Import the module. Its global guard then requires a signed-in user on every route:
+
+```ts
+@Module({
+  imports: [
+    AuthenticationModule.forRoot({
+      accessToken: {
+        key: process.env.JWT_SECRET!,
+        issuer: 'https://api.example.com',
+        audience: 'web',
+        ttl: '15m',
+      },
+    }),
+  ],
+  providers: [JwtAuth],
+})
+export class AppModule {}
+```
+
+Credential providers are ordinary injectable classes that register themselves with `AuthenticationRegistry`:
+
+```ts
+@Injectable()
+export class JwtAuth extends JwtBearerProvider<User> {
+  constructor(
+    private readonly users: UsersRepository,
+    registry: AuthenticationRegistry,
+  ) {
+    super(); // verifies the tokens the module's `accessToken` option signs
+    registry.registerProvider(this);
+  }
+
+  validate({ sub }: JwtClaims) {
+    return sub ? this.users.findById(sub) : null;
+  }
+}
+```
+
+Then use `@Public()` to opt a route out, and `@Authenticate()` to change what a route requires:
+
+```ts
+@Controller()
+export class AppController {
+  @Public()
+  @Get('health')
+  health() {
+    return 'ok';
+  }
+
+  @Authenticate({ mfa: true })
+  @Get('me')
+  me(@CurrentUser() user: User) {
+    return user;
+  }
+}
+```
+
+The in-memory stores are fine in development. In production, startup fails until you register a store for each feature you use with `AuthenticationStorage.registerSource()`, or you set `allowInMemoryStorage: true`. Read [Overview & Tutorial](https://docs.nestjs.com/security/authentication) for sessions, refresh tokens, TOTP, magic links, OIDC and account flows.
 
 ## Support
 
