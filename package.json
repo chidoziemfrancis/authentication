@@ -22,7 +22,7 @@
     "./package.json": "./package.json"
   },
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=20.19.0"
   },
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
