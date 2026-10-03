@@ -147,7 +147,7 @@ from the main (upstream) repository:
 
 ## <a name="development"></a> Development Setup
 
-You need Node.js 22.12 or newer. To run the suites that use a database, you also need PostgreSQL.
+You need Node.js 20.19 or newer. To run the suites that use a database, you also need PostgreSQL.
 
 ```shell
 npm install
