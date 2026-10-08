@@ -1,4 +1,4 @@
-import { Controller, Get, Injectable, Module, Post, UseGuards, type INestApplication } from '@nestjs/common';
+import { Controller, Get, Injectable, Logger, Module, Post, UseGuards, type INestApplication } from '@nestjs/common';
 import request from 'supertest';
 import { AuthorizationModule, Can, Policy } from '@nestjs/authorization';
 import { adapters, createApp } from './support/adapters.js';
@@ -85,6 +85,48 @@ class DraftsController {
 })
 class LateSubclassAppModule {}
 
+/** Authorization denies a handler that declares no check; `@Public()` counts as one. */
+@Controller('catalog')
+@Can(ArticlePolicy, 'create')
+class CatalogController {
+  // A @Public() method lifts the class's @Can(), as it lifts the class's authentication.
+  @Get('public')
+  @Public()
+  open() {
+    return 'public';
+  }
+
+  @Get('anyone')
+  @Can.Anyone()
+  anyone() {
+    return 'anyone';
+  }
+
+  @Get('editors')
+  editors() {
+    return 'editors';
+  }
+}
+
+@Controller('lobby')
+@Public()
+class LobbyController {
+  @Get()
+  landing() {
+    return 'landing';
+  }
+
+  // Back under authentication, so no longer public: it declares no check.
+  @Get('account')
+  @Authenticate()
+  account() {
+    return 'account';
+  }
+}
+
+@Module({ imports: [authentication, authorization, KeysModule], controllers: [CatalogController, LobbyController] })
+class DenyByDefaultAppModule {}
+
 describe.each(adapters.map((a) => a.name))('with @nestjs/authorization (%s)', (adapter) => {
   describe('authentication imported first', () => {
     let app: INestApplication;
@@ -132,5 +174,39 @@ describe.each(adapters.map((a) => a.name))('with @nestjs/authorization (%s)', (a
     it('recognizes a subclass by the brand, whatever its name', async () => {
       await expect(createApp(adapter, LateSubclassAppModule)).rejects.toThrow(/AuthorizationGuard runs before Gatekeeper/);
     });
+  });
+});
+
+describe.each(adapters.map((a) => a.name))('deny by default, with the real @Public() (%s)', (adapter) => {
+  let app: INestApplication;
+  const errors: unknown[] = [];
+  const http = () => request(app.getHttpServer());
+  beforeAll(async () => {
+    vi.spyOn(Logger.prototype, 'error').mockImplementation((message: unknown) => {
+      errors.push(message);
+    });
+    app = await createApp(adapter, DenyByDefaultAppModule);
+  });
+  afterAll(async () => {
+    await app.close();
+    vi.restoreAllMocks();
+  });
+
+  it("lets guests through a @Public() method, which lifts the class's @Can()", async () => {
+    await http().get('/catalog/public').expect(200, 'public');
+    await http().get('/lobby').expect(200, 'landing');
+  });
+
+  it("applies the class's @Can() elsewhere, and @Can.Anyone() to any signed-in user", async () => {
+    await http().get('/catalog/editors').set('x-api-key', 'key-viewer').expect(403);
+    await http().get('/catalog/editors').set('x-api-key', 'key-ci').expect(200, 'editors');
+    await http().get('/catalog/anyone').set('x-api-key', 'key-viewer').expect(200, 'anyone');
+    await http().get('/catalog/anyone').expect(401);
+  });
+
+  it('denies a method @Authenticate() takes out of a @Public() class, and names it at startup', async () => {
+    await http().get('/lobby/account').expect(401);
+    await http().get('/lobby/account').set('x-api-key', 'key-ci').expect(403);
+    expect(errors).toEqual([expect.stringContaining('AuthorizationGuard denies every call to LobbyController.account:')]);
   });
 });

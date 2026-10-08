@@ -56,12 +56,14 @@ describe('GraphQL (Apollo) with @nestjs/authentication', () => {
 
     @Query('product')
     @Authenticate({ optional: true })
+    @Can.Anyone()
     product(@CurrentUser() user: User | null, @Args('id') id: string) {
       return this.productsService.findOne(user, id);
     }
 
     @Query('products')
     @Authenticate({ optional: true })
+    @Can.Anyone()
     products(@CurrentUser() user: User | null) {
       return this.productsService.findAll(user);
     }
@@ -184,6 +186,7 @@ describe('WebSockets (platform-ws) with @nestjs/authentication', () => {
 
     @SubscribeMessage('show')
     @Authenticate({ optional: true })
+    @Can.Anyone()
     async show(@CurrentUser() user: User | null, @MessageBody() body: { id: string }) {
       return { event: 'product', data: (await this.productsService.findOne(user, body.id)).name };
     }
@@ -271,6 +274,7 @@ describe('TCP microservice with @nestjs/authentication', () => {
     constructor(private readonly ordersService: OrdersService) {}
 
     @MessagePattern('orders.refund')
+    @Can.Anyone()
     refund(@CurrentUser() user: User, @Payload() data: { id: string }) {
       return this.ordersService.refund(user, data.id);
     }

@@ -163,17 +163,20 @@ class PostsController {
 
   @Get()
   @Authenticate({ optional: true })
+  @Can.Anyone()
   findAll(@CurrentUser() user: User | null) {
     return this.postsService.findAll(user);
   }
 
   @Get(':id')
   @Authenticate({ optional: true })
+  @Can.Anyone()
   findOne(@CurrentUser() user: User | null, @Param('id', ParseIntPipe) id: number) {
     return this.postsService.findOne(user, id);
   }
 
   @Patch(':id')
+  @Can.Anyone()
   rename(@CurrentUser() user: User, @Param('id', ParseIntPipe) id: number, @Body() body: { title: string }) {
     return this.postsService.rename(user, id, body.title);
   }

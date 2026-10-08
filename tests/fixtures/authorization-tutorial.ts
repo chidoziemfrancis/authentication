@@ -216,12 +216,14 @@ export class ProductsController {
 
   @Get()
   @Authenticate({ optional: true })
+  @Can.Anyone()
   findAll(@CurrentUser() user: User | null) {
     return this.productsService.findAll(user);
   }
 
   @Get(':id')
   @Authenticate({ optional: true })
+  @Can.Anyone()
   findOne(@CurrentUser() user: User | null, @Param('id') id: string) {
     return this.productsService.findOne(user, id);
   }
@@ -338,17 +340,20 @@ export class OrdersController {
   constructor(private readonly ordersService: OrdersService) {}
 
   @Get()
+  @Can.Anyone()
   findAll(@CurrentUser() user: User) {
     return this.ordersService.findAll(user);
   }
 
   @Get(':id')
+  @Can.Anyone()
   findOne(@CurrentUser() user: User, @Param('id') id: string) {
     return this.ordersService.findOne(user, id);
   }
 
   @Post(':id/refund')
   @HttpCode(200)
+  @Can.Anyone()
   refund(@CurrentUser() user: User, @Param('id') id: string) {
     return this.ordersService.refund(user, id);
   }
