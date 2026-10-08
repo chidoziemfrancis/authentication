@@ -5,7 +5,16 @@ import type { JwsAlgorithm, JwtClaims } from '../interfaces/jwt.interface.js';
 import type { JwtSignerOptions } from '../interfaces/jwt-options.interface.js';
 import type { JwtVerifierOptions } from '../interfaces/jwt-options.interface.js';
 import { JwksClient } from './jwks.client.js';
-import { algorithmFor, assertKeyFits, decodeJws, toKeyObject, validateClaims, verifySignature } from './jws.util.js';
+import {
+  algorithmFor,
+  assertKeyFits,
+  decodeJws,
+  isHmac,
+  toKeyObject,
+  unsupportedKeyError,
+  validateClaims,
+  verifySignature,
+} from './jws.util.js';
 
 /**
  * Verifies compact JWS tokens and their registered claims. `verify()`
@@ -35,7 +44,7 @@ export class JwtVerifier {
     if (this.key) {
       const implied = algorithmFor(this.key);
       if (!implied) {
-        throw new TypeError(`JwtVerifier: ${this.key.asymmetricKeyType} keys are not supported.`);
+        throw unsupportedKeyError(this.key, 'JwtVerifier');
       }
       this.algorithms = options.algorithms ?? [implied];
       for (const alg of this.algorithms) {
@@ -48,8 +57,10 @@ export class JwtVerifier {
       }
     } else {
       this.algorithms = options.algorithms ?? ['RS256', 'ES256'];
-      if (this.algorithms.includes('HS256')) {
-        throw new TypeError('JwtVerifier: HS256 cannot be combined with a JWKS.');
+      // A JWKS publishes keys to everyone: an HMAC secret taken from one would let anyone sign.
+      const hmac = this.algorithms.find(isHmac);
+      if (hmac) {
+        throw new TypeError(`JwtVerifier: ${hmac} cannot be combined with a JWKS.`);
       }
       requireIssuerAndAudience(options, '`jwks`');
     }
