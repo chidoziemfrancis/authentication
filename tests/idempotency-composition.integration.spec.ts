@@ -24,7 +24,7 @@ import {
   AuthenticationRegistry,
   CurrentUser,
 } from '../lib/index.js';
-import { AuthorizationModule, AuthorizationService, Policy } from '@nestjs/authorization';
+import { AuthorizationModule, AuthorizationService, Can, Policy } from '@nestjs/authorization';
 import { ResilienceModule, Retry } from '@nestjs/resilience';
 import { adapters, createApp, type AdapterName } from './support/adapters.js';
 import { IdempotencyModule, Idempotent, InMemoryIdempotencyStore, type IdempotencyModuleOptions } from '@nestjs/idempotency';
@@ -94,6 +94,7 @@ class OrdersController {
   @Post(':id/pay')
   @Idempotent({ required: true })
   @Retry({ idempotent: true, attempts: 3, backoff: { delay: 1, jitter: 'none' } })
+  @Can.Anyone()
   async pay(@Param('id') id: string, @CurrentUser() user: User, @Body() body: { paymentMethod: string }) {
     await this.authorizationService.authorize(OrderPolicy, 'pay', user, ORDERS[id]!);
 

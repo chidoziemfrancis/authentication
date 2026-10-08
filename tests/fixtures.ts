@@ -16,6 +16,7 @@ import {
   type ExecutionContext,
   type OnModuleInit,
 } from '@nestjs/common';
+import { Can } from '@nestjs/authorization';
 import {
   Authenticate,
   AuthenticationContext,
@@ -83,6 +84,7 @@ export interface User {
 declare module '../lib/index.js' {
   interface AuthenticationTypes {
     user: User;
+    sessionExtra: { user: User };
   }
 }
 
@@ -266,6 +268,8 @@ export class WhoAmIService {
   }
 }
 
+// Users manage their own second factor and sessions: being signed in is the only permission.
+@Can.Anyone()
 @Controller('auth')
 export class AuthController {
   constructor(

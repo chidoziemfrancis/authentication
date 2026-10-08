@@ -21,32 +21,41 @@ import type {
 /**
  * @internal What each feature reads or writes, audited against the code
  * paths: the production guard's rule.
- * Any feature that signs someone in reads `mfa`, configured or not: a user
- * may have enrolled an authenticator through another instance, and
- * `MfaService.isEnrolled()` is how a sign-in finds out. Any feature that
- * revokes a user's sign-ins reaches both `sessions` and `refreshTokens`.
+ * MFA is off unless `mfa` is configured: without it, `MfaService.isEnrolled()`
+ * answers `false` without reading the store, and its other methods throw.
+ * Refresh tokens exist only with `accessToken`, and not with
+ * `refreshToken: false`: otherwise `TokenService.issue()` starts no family
+ * and `revokeAll()` has nothing to revoke and reads nothing. Apps
+ * that sign users in from a shared user database must therefore agree: if
+ * one configures `mfa` (or `accessToken`), every one of them must, or a user
+ * who enrolled an authenticator through one signs in to another with a
+ * password alone (and a sign-out everywhere leaves token clients signed in).
+ * Removing `mfa` turns MFA off for everyone.
  */
 export const CONTRACTS_BY_FEATURE = {
   /**
    * A `SessionCookieProvider` in `providers`: `SessionService` (every
-   * request), `SignInService.signIn()` (`isEnrolled()`), `completeMfa()`,
-   * and `signOutEverywhere()`, which also revokes the user's refresh-token
-   * families.
+   * request), `SignInService.signIn()` and `signOutEverywhere()`.
    */
-  sessionCookie: ['sessions', 'refreshTokens', 'mfa'],
-  /** `accessToken`: `TokenService` (refresh-token families), whose `issue()` checks for an authenticator. */
-  accessToken: ['refreshTokens', 'mfa'],
-  /** `mfa`: enrollment, codes, recovery codes and the lockout. */
+  sessionCookie: ['sessions'],
+  /**
+   * `accessToken` without `refreshToken: false`: the refresh-token families
+   * `TokenService` starts, which every sign-out everywhere revokes too.
+   * Access tokens alone keep no state.
+   */
+  refreshToken: ['refreshTokens'],
+  /** `mfa`: enrollment, codes, recovery codes and the lockout; every sign-in checks for an authenticator. */
   mfa: ['mfa'],
   /** `magicLinkHandler`: pending links, then `SignInService.signIn()`. */
-  magicLink: ['sessions', 'mfa', 'magicLinks'],
+  magicLink: ['sessions', 'magicLinks'],
   /** `oidcAccountResolver`: logins in progress, the session that links an account, then `SignInService.signIn()`. */
-  oidc: ['sessions', 'mfa', 'oidcStates'],
+  oidc: ['sessions', 'oidcStates'],
   /**
-   * `passwordResetHandler`: the links; `reset()` revokes every session and
-   * refresh-token family of the user, and with `signIn: true` signs in.
+   * `passwordResetHandler`: the links; `reset()` revokes every session (and
+   * refresh-token family, with refresh tokens on) of the user, and with
+   * `signIn: true` signs in.
    */
-  passwordReset: ['sessions', 'refreshTokens', 'mfa', 'emailTokens'],
+  passwordReset: ['sessions', 'emailTokens'],
   /** `emailVerificationHandler`: the links. */
   emailVerification: ['emailTokens'],
 } as const satisfies Record<string, readonly AuthenticationStorageContract[]>;

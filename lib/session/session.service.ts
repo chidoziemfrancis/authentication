@@ -1,4 +1,4 @@
-import { Inject, Injectable, Optional } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { firstHeader } from '../utils/auth-state.util.js';
 import { AUTHENTICATION_MODULE_OPTIONS } from '../authentication.constants.js';
 import { isCrossOriginWrite, normalizeOrigin } from '../utils/cross-origin.util.js';
@@ -26,6 +26,7 @@ type RequestHeaders = Record<string, string | string[] | undefined>;
  */
 @Injectable()
 export class SessionService {
+  private static readonly logger = new Logger('SessionService');
   private readonly options: SessionOptions;
   private readonly absoluteTtl: number;
   private readonly pendingTtl: number;
@@ -33,6 +34,8 @@ export class SessionService {
   private readonly touchInterval: number;
   private readonly cookieName: string;
   private readonly trustedOrigins: ReadonlySet<string>;
+  /** Touches failed since the last successful one: a spell of failures logs one warning, not one per request. */
+  private failedTouches = 0;
 
   constructor(
     private readonly storage: AuthenticationStorage,
@@ -88,7 +91,11 @@ export class SessionService {
     });
   }
 
-  /** The live session for a token, sliding its idle timeout. */
+  /**
+   * The live session for a token, sliding its idle timeout. Sliding is
+   * best-effort: when the store fails to record the activity, the session
+   * is still returned, as read (see `SessionStore.touchSession()`).
+   */
   async validate(token: string | undefined): Promise<SessionRecord | null> {
     if (!token || !TOKEN_PATTERN.test(token)) {
       return null;
@@ -111,8 +118,7 @@ export class SessionService {
     }
 
     if (now - record.lastActiveAt.getTime() >= this.touchInterval) {
-      record.lastActiveAt = new Date(now);
-      await this.storage.sessions.touchSession(record.id, record.lastActiveAt);
+      await this.touch(record, new Date(now));
     }
 
     return record;
@@ -126,13 +132,14 @@ export class SessionService {
    * `absoluteTtl` from its creation, in place of its `mfa.pendingTtl`.
    * Resolves `null` when the session was gone by the time it was replaced:
    * revoked (a sign-out everywhere, a password reset) or rotated by another
-   * request, which leaves no new session behind.
+   * request, which leaves no new session behind. The session's `extra` is
+   * not carried over.
    */
   async rotate(
     session: SessionRecord,
     changes: Pick<Partial<SessionRecord>, 'mfa' | 'metadata'> = {},
   ): Promise<IssuedSession | null> {
-    const { id: _, ...rest } = session;
+    const { id: _, extra: _extra, ...rest } = session;
     const verifying = session.mfa === 'pending' && changes.mfa === 'verified';
     // The new session first, then the old one, which must still be there to delete: if a revocation
     // took it meanwhile (deleting the user's sessions, this new one included, or not yet), or another
@@ -217,6 +224,37 @@ export class SessionService {
     await this.storage.sessions.deleteSession(sessionId);
   }
 
+  /**
+   * Records activity, best-effort: the session was read live, so a failed write (a lock timeout,
+   * a read-only replica) does not fail the request, and the session keeps the idle deadline the
+   * store still has. Every failure is published as `session-touch-failed`; the log gets one warning
+   * per spell of failures (the first), then one line once a touch succeeds again, with how many
+   * failed in between.
+   */
+  private async touch(record: SessionRecord, lastActiveAt: Date): Promise<void> {
+    try {
+      await this.storage.sessions.touchSession(record.id, lastActiveAt);
+    } catch (error) {
+      if (this.failedTouches++ === 0) {
+        SessionService.logger.warn(
+          `Recording activity on a session of user ${record.userId} failed, so its idle timeout did not move: ` +
+            (error instanceof Error ? error.message : String(error)) +
+            '. Further failures are not logged until a touch succeeds again.',
+        );
+      }
+      // Published on every failure, logged or not, so metrics and alerting count them all.
+      this.events.emit({ type: 'session-touch-failed', userId: record.userId, sessionId: record.id, error });
+      return;
+    }
+    record.lastActiveAt = lastActiveAt;
+    if (this.failedTouches > 0) {
+      SessionService.logger.log(
+        `Recording session activity works again; ${this.failedTouches} ${this.failedTouches === 1 ? 'touch' : 'touches'} failed meanwhile.`,
+      );
+      this.failedTouches = 0;
+    }
+  }
+
   private isLive(record: SessionRecord, now: number): boolean {
     if (hasExpired(record.expiresAt, now)) {
       return false;
@@ -224,7 +262,7 @@ export class SessionService {
     return this.idleTtl === 0 || now < record.lastActiveAt.getTime() + this.idleTtl;
   }
 
-  private async issue(fields: Omit<SessionRecord, 'id'>): Promise<IssuedSession> {
+  private async issue(fields: Omit<SessionRecord, 'id' | 'extra'>): Promise<IssuedSession> {
     const token = randomToken();
     const session: SessionRecord = { id: sha256(token), ...fields };
     await this.storage.sessions.createSession(session);
