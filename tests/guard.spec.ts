@@ -22,7 +22,7 @@ import {
   WsAuthenticator,
   type AuthenticationResult,
 } from '../lib/index.js';
-import { AUTHENTICATION_METADATA } from '../lib/authentication.constants.js';
+import { AUTHENTICATION_METADATA, AUTHENTICATION_PUBLIC } from '../lib/authentication.constants.js';
 import { LOCK_REGISTRY } from '../lib/services/authentication-registry.service.js';
 
 type User = { id: string; emailVerified?: boolean };
@@ -451,6 +451,31 @@ describe('route decorators', () => {
     expect(metadata(Open)).toEqual({ public: true });
     expect(metadata(Open.prototype.strict)).toEqual({ verifiedEmail: true, public: false });
     expect(metadata(Open.prototype.plain)).toBeUndefined();
+  });
+
+  it('publish whether a route is public under a registry symbol, for @nestjs/authorization', () => {
+    const isPublic = (target: object) => Reflect.getMetadata(Symbol.for('@nestjs/authentication:public'), target);
+
+    @Public()
+    class Open {
+      @Authenticate({ optional: true })
+      optional() {}
+      @Public()
+      @Authenticate()
+      reopened() {}
+      @Authenticate({ mfa: undefined })
+      configured() {}
+      plain() {}
+    }
+
+    expect(AUTHENTICATION_PUBLIC).toBe(Symbol.for('@nestjs/authentication:public'));
+    expect(isPublic(Open)).toBe(true);
+    // Optional authentication is not public: a guest is let in, a token still counts.
+    expect(isPublic(Open.prototype.optional)).toBe(false);
+    expect(isPublic(Open.prototype.reopened)).toBe(true);
+    expect(isPublic(Open.prototype.configured)).toBe(false);
+    // Nothing on the method: readers fall back to the class.
+    expect(isPublic(Open.prototype.plain)).toBeUndefined();
   });
 
   function factoryOf(decorator: ParameterDecorator) {

@@ -1,4 +1,4 @@
-import { AUTHENTICATION_METADATA } from '../authentication.constants.js';
+import { AUTHENTICATION_METADATA, AUTHENTICATION_PUBLIC } from '../authentication.constants.js';
 import type { AuthenticateOptions, RouteAuthentication } from '../interfaces/authenticate-options.interface.js';
 
 /** Merges into the metadata already on the class or method, so decorators can be stacked. */
@@ -8,6 +8,9 @@ export function route(value: RouteAuthentication): ClassDecorator & MethodDecora
     const holder = descriptor ? descriptor.value : target;
     const existing: RouteAuthentication | undefined = Reflect.getMetadata(AUTHENTICATION_METADATA, holder);
     Reflect.defineMetadata(AUTHENTICATION_METADATA, { ...existing, ...defined }, holder);
+    if (value.public !== undefined) {
+      Reflect.defineMetadata(AUTHENTICATION_PUBLIC, value.public, holder);
+    }
   };
 
   return decorator as ClassDecorator & MethodDecorator;

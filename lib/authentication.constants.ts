@@ -14,3 +14,13 @@ export const AUTHENTICATION_METADATA = 'authentication:route';
  * so every copy of either package agrees on it.
  */
 export const AUTHENTICATION_GUARD_BRAND = Symbol.for('@nestjs/authentication:guard');
+
+/**
+ * @internal Whether a route is public, written next to the route metadata by
+ * `@Public()` (`true`) and `@Authenticate()` (`false`), on the class or the
+ * method: the method's value, when it has one, wins. `@nestjs/authorization`
+ * reads it, without importing this package, so that a `@Public()` route
+ * needs no `@Can.Anyone()`. A registry symbol, so every copy of either
+ * package agrees on it.
+ */
+export const AUTHENTICATION_PUBLIC = Symbol.for('@nestjs/authentication:public');
