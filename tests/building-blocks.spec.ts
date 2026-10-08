@@ -998,6 +998,14 @@ describe('TokenService', () => {
     const { service } = setup(null);
     await expect(service.issue('u1')).rejects.toThrow(/configure `accessToken`/);
     await expect(service.refresh('A'.repeat(43))).rejects.toThrow(/configure `accessToken`/);
+    await expect(service.revoke('A'.repeat(43))).rejects.toThrow(/configure `accessToken`/);
+    // No refresh tokens without `accessToken`: a sign-out everywhere has none to revoke, and reads no store.
+    const unread = {
+      get refreshTokens(): never {
+        throw new Error('the refresh-token store was read');
+      },
+    };
+    await expect(new TokenService(unread as never).revokeAll('u1')).resolves.toBeUndefined();
   });
 
   it('checks the signing key when it is created', () => {
@@ -1313,7 +1321,7 @@ describe('AuthenticationGuard, outside HTTP', () => {
 
     const error = await guard.canActivate(call(Handler, 'handle', {})).catch((e) => e);
     expect(error).toBeInstanceOf(RpcException);
-    expect(error.getError()).toEqual({ statusCode: 401, message: 'Unauthorized' });
+    expect(error.getError()).toEqual({ statusCode: 401, message: 'Unauthorized', errorCode: 'missing_credentials' });
 
     const rpcContext: { user?: unknown } = {};
     await expect(guard.canActivate(call(Handler, 'handle', { token: 't' }, rpcContext))).resolves.toBe(true);
@@ -1337,7 +1345,7 @@ describe('AuthenticationGuard, outside HTTP', () => {
     // optional (class) + mfa (method): anonymous passes, a user without MFA does not.
     await expect(guard.canActivate(call(Optional, 'stepUp', {}))).resolves.toBe(true);
     await expect(guard.canActivate(call(Optional, 'stepUp', { token: 't' }))).rejects.toMatchObject({
-      error: { statusCode: 401, error: 'mfa_required', message: 'Second factor required' },
+      error: { statusCode: 401, error: 'mfa_required', errorCode: 'mfa_required', message: 'Second factor required' },
     });
     await expect(guard.canActivate(call(Optional, 'stepUp', { token: 'mfa' }))).resolves.toBe(true);
     await expect(guard.canActivate(call(Optional, 'plain', { token: 't' }))).resolves.toBe(true);
@@ -1416,7 +1424,7 @@ describe('AuthenticationError thrown under a handler', () => {
     }
   });
 
-  it('a 409 becomes each transport’s conflict, and `code` becomes the body’s `error`', async () => {
+  it('a 409 becomes each transport’s conflict, and `code` becomes the body’s `errorCode` (and `error`)', async () => {
     const scope = new AuthenticationScope();
     const interceptor = new AuthenticationScopeInterceptor(scope, new HttpAdapterHost());
     class Handler {
@@ -1437,7 +1445,90 @@ describe('AuthenticationError thrown under a handler', () => {
     expect(ws.getError()).toEqual({ status: 'error', statusCode: 409, message: 'Authenticator already enrolled' });
 
     const coded = await run('http', new AuthenticationError('Second factor required', { code: 'mfa_required' }));
-    expect(coded.getResponse()).toEqual({ message: 'Second factor required', error: 'mfa_required', statusCode: 401 });
+    expect(coded.getResponse()).toEqual({ message: 'Second factor required', error: 'mfa_required', statusCode: 401, errorCode: 'mfa_required' });
+    expect(coded.errorCode).toBe('mfa_required');
+  });
+
+  describe('`errorCode` and `details` in the body, on every transport', () => {
+    const run = async (type: string, error: Error): Promise<any> => {
+      const interceptor = new AuthenticationScopeInterceptor(new AuthenticationScope(), new HttpAdapterHost());
+      class Handler {
+        handle() {}
+      }
+      const ctx = new ExecutionContextHost([{}, {}], Handler, Handler.prototype.handle);
+      ctx.setType(type as never);
+      return lastValueFrom(interceptor.intercept(ctx, { handle: () => throwError(() => error) })).catch((e: unknown) => e);
+    };
+    const body = (exception: any) => ('getResponse' in exception ? exception.getResponse() : exception.getError());
+    const throttled = () =>
+      new AuthenticationError('Too many attempts', {
+        code: 'too_many_attempts',
+        details: { retryAfter: 30 },
+        challenge: 'Bearer realm="app"',
+        cause: new Error('internal: limiter key ip:10.0.0.1'),
+      });
+
+    it('HTTP and GraphQL: Nest’s own body and `errorCode` for the code, key for key, then `details`', async () => {
+      // `error` as before (the code as Nest's description), then Nest's own `errorCode`.
+      const nest = new UnauthorizedException('Too many attempts', { description: 'too_many_attempts', errorCode: 'too_many_attempts' });
+      expect(JSON.stringify(nest.getResponse())).toBe(
+        '{"message":"Too many attempts","error":"too_many_attempts","statusCode":401,"errorCode":"too_many_attempts"}',
+      );
+      for (const type of ['http', 'graphql']) {
+        const error = await run(type, throttled());
+        expect(error).toBeInstanceOf(UnauthorizedException);
+        expect(JSON.stringify(error.getResponse())).toBe(JSON.stringify({ ...(nest.getResponse() as object), details: { retryAfter: 30 } }));
+        expect(error.errorCode).toBe('too_many_attempts'); // what exception filters read
+        expect(error.message).toBe('Too many attempts');
+        expect(error.cause).toBeInstanceOf(AuthenticationError);
+      }
+    });
+
+    it('ws and rpc: the same keys in their payloads', async () => {
+      const fields = { statusCode: 401, error: 'too_many_attempts', message: 'Too many attempts', errorCode: 'too_many_attempts', details: { retryAfter: 30 } };
+      expect((await run('ws', throttled())).getError()).toEqual({ status: 'error', ...fields });
+      expect((await run('rpc', throttled())).getError()).toEqual(fields);
+    });
+
+    it('sends `details` without a code, and no `errorCode` where there is none', async () => {
+      const error = () => new AuthenticationError('Slow down', { details: { retryAfter: 5 } });
+      const http = await run('http', error());
+      expect(http.getResponse()).toEqual({ message: 'Slow down', error: 'Unauthorized', statusCode: 401, details: { retryAfter: 5 } });
+      expect(http.errorCode).toBeUndefined();
+      expect((await run('ws', error())).getError()).toEqual({ status: 'error', statusCode: 401, message: 'Slow down', details: { retryAfter: 5 } });
+      expect((await run('rpc', error())).getError()).toEqual({ statusCode: 401, message: 'Slow down', details: { retryAfter: 5 } });
+    });
+
+    it('leaves code-less refusals as they were: `Unauthorized` or `Conflict` in `error` over HTTP, none elsewhere', async () => {
+      for (const type of ['http', 'graphql']) {
+        expect((await run(type, new RefreshTokenError('reused'))).getResponse()).toEqual({
+          message: 'Refresh token reused',
+          error: 'Unauthorized',
+          statusCode: 401,
+        });
+        expect((await run(type, new MfaAlreadyEnrolledError('u1'))).getResponse()).toEqual({
+          message: 'Authenticator already enrolled',
+          error: 'Conflict',
+          statusCode: 409,
+        });
+        expect((await run(type, new AuthenticationError())).getResponse()).toEqual({ message: 'Unauthorized', statusCode: 401 });
+      }
+      for (const type of ['ws', 'rpc']) {
+        for (const error of [new RefreshTokenError('reused'), new MfaAlreadyEnrolledError('u1'), new AuthenticationError()]) {
+          const payload = body(await run(type, error));
+          expect(payload).not.toHaveProperty('errorCode');
+          expect(payload).not.toHaveProperty('error');
+          expect(payload).not.toHaveProperty('details');
+        }
+      }
+    });
+
+    it('never puts the cause, the challenge or other properties of the error in the body', async () => {
+      for (const type of ['http', 'graphql', 'ws', 'rpc']) {
+        const payload = JSON.stringify(body(await run(type, throttled())));
+        expect(payload).not.toMatch(/internal|limiter|realm|cause|challenge|stack/);
+      }
+    });
   });
 
   it('other errors pass through untouched', async () => {
@@ -1569,7 +1660,37 @@ describe('TOTP secret encryption at rest', () => {
 
     // Without any MFA config, enrollment refuses rather than storing plaintext.
     await expect(service(store, {}).enroll('u2', 'u2')).rejects.toThrow(/not configured/);
-    await expect(service(store, {}).isEnrolled('u1')).resolves.toBe(true);
+    // And MFA is off: an enrolled user has no second factor to give, and the store is not read.
+    const getTotp = vi.spyOn(store, 'getTotp');
+    await expect(service(store, {}).isEnrolled('u1')).resolves.toBe(false);
+    expect(getTotp).not.toHaveBeenCalled();
+  });
+
+  it('without the `mfa` option, every method but isEnrolled() throws before touching the store', async () => {
+    const store = new InMemoryMfaStore();
+    const touched = vi.fn();
+    const watched = new Proxy(store, {
+      get: (target, key) => {
+        const value = Reflect.get(target, key, target);
+        return typeof value === 'function' ? (...args: unknown[]) => (touched(key), value.apply(target, args)) : value;
+      },
+    });
+    const off = service(watched, {});
+
+    await expect(off.isEnrolled('u1')).resolves.toBe(false);
+    for (const call of [
+      () => off.enroll('u1', 'u1'),
+      () => off.confirm('u1', '000000'),
+      () => off.verifyTotp('u1', '000000'),
+      () => off.verifyRecoveryCode('u1', 'AAAAA-AAAAA'),
+      () => off.generateRecoveryCodes('u1'),
+      () => off.remainingRecoveryCodes('u1'),
+      () => off.disable('u1'),
+      () => off.reencrypt('u1'),
+    ]) {
+      await expect(call()).rejects.toThrow('MFA is not configured');
+    }
+    expect(touched).not.toHaveBeenCalled();
   });
 
   it('validates keys, naming the offending entry and never its value', () => {

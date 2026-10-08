@@ -4,13 +4,26 @@
  * `mfa.pendingTtl`, and `trustedOrigins` for writes and sign-ins from another origin.
  */
 import { createHash } from 'node:crypto';
+import { subscribe, unsubscribe } from 'node:diagnostics_channel';
 import type { AddressInfo } from 'node:net';
-import { Body, Controller, Get, HttpCode, Injectable, Module, Post, UnauthorizedException, type INestApplication } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  Injectable,
+  Logger,
+  Module,
+  Post,
+  UnauthorizedException,
+  type INestApplication,
+} from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
 import { adapters, createApp } from './support/adapters.js';
 import {
   Authenticate,
+  AuthenticationEvents,
   AuthenticationModule,
   AuthenticationRegistry,
   AuthenticationStorage,
@@ -19,6 +32,7 @@ import {
   Public,
   SessionCookieProvider,
   SignInService,
+  type AuthenticationEvent,
   type AuthenticationModuleOptions,
   type SessionRecord,
 } from '../lib/index.js';
@@ -164,6 +178,48 @@ describe.each(adapters.map((a) => a.name))('session options (%s)', (adapter) => 
       expect(await session(cookie)).toBeDefined();
     });
 
+    it('answers a valid session when recording its activity fails, keeping its idle deadline and reporting the failure', async () => {
+      const { cookie, userId } = await signIn();
+      const signedInAt = clock;
+      const store = app.get(AuthenticationStorage).sessions;
+      const failure = new Error('lock wait timeout exceeded');
+      const touch = vi.spyOn(store, 'touchSession').mockRejectedValueOnce(failure);
+      const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      const log = vi.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+      const fromStream: AuthenticationEvent[] = [];
+      const fromChannel: unknown[] = [];
+      const onChannel = (message: unknown) => void fromChannel.push(message);
+      const subscription = app.get(AuthenticationEvents).events$.subscribe((event) => fromStream.push(event));
+      subscribe('nestjs:authentication:session-touch-failed', onChannel);
+
+      try {
+        clock += 6 * MINUTE;
+        await http().get('/me').set('Cookie', cookie).expect(200, { id: userId });
+        expect(touch).toHaveBeenCalledTimes(1);
+        expect((await session(cookie))!.lastActiveAt.getTime()).toBe(signedInAt);
+
+        const event = { type: 'session-touch-failed', userId, sessionId: sha256(cookie.split('=')[1]), error: failure };
+        expect(fromStream).toEqual([event]);
+        expect(fromChannel).toEqual([event]);
+        expect(warn.mock.calls.map(([message]) => String(message))).toContainEqual(
+          expect.stringContaining(`Recording activity on a session of user ${userId} failed`),
+        );
+
+        // The next request records the activity, and says recording works again.
+        await http().get('/me').set('Cookie', cookie).expect(200, { id: userId });
+        expect((await session(cookie))!.lastActiveAt.getTime()).toBe(clock);
+        expect(log.mock.calls.map(([message]) => String(message))).toContainEqual(
+          expect.stringContaining('Recording session activity works again; 1 touch failed meanwhile.'),
+        );
+      } finally {
+        unsubscribe('nestjs:authentication:session-touch-failed', onChannel);
+        subscription.unsubscribe();
+        warn.mockRestore();
+        log.mockRestore();
+        touch.mockRestore();
+      }
+    });
+
     it('ends a session at its absolute expiry however active it is, and deletes it', async () => {
       const { cookie } = await signIn();
 
@@ -217,7 +273,7 @@ describe.each(adapters.map((a) => a.name))('session options (%s)', (adapter) => 
       await write({ 'Sec-Fetch-Site': 'cross-site', Origin: TRUSTED }).expect(201);
 
       const refused = await write({ Origin: 'https://evil.test' }).expect(401);
-      expect(refused.body).toEqual({ message: 'Unauthorized', statusCode: 401 });
+      expect(refused.body).toEqual({ message: 'Unauthorized', statusCode: 401, errorCode: 'missing_credentials' });
       await write({ 'Sec-Fetch-Site': 'cross-site', Origin: 'https://evil.test' }).expect(401);
       await write({ 'Sec-Fetch-Site': 'same-site', Origin: 'https://sub.app.example.com' }).expect(401);
 
